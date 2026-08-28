@@ -352,4 +352,17 @@ def channel_handler(message: types.Message):
 if __name__ == "__main__":
     logger.info("Starting Ultimate Downloader Bot...")
     Path(DOWNLOAD_ROOT).mkdir(exist_ok=True)
+
+    # Muk்கியம்: முன்பு webhook set பண்ணி இருந்தா, polling எந்த
+    # update-உம் receive பண்ணாது (start கூட வேலை செய்யாது).
+    # இதை clear பண்றது mandatory.
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+    except Exception as e:
+        logger.warning("remove_webhook failed: %s", e)
+
+    me = bot.get_me()
+    logger.info("Logged in as @%s (id=%s) — bot is now polling for messages...", me.username, me.id)
+
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
