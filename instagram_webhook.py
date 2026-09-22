@@ -148,26 +148,32 @@ def _download_instagram_attachment(url: str) -> tuple[list[Path], str | None]:
         raise
 
 
-def _download_and_forward(bot, url: str, caption: str | None = None) -> None:
-    temp_dir = None
+def _download_and_forward(bot, urls: list[str], caption: str | None = None) -> None:
+    temp_dirs: list[str] = []
+    all_files: list[Path] = []
     try:
-        if "lookaside.fbsbx.com" in url or "fbsbx.com" in url:
-            files, temp_dir = _download_instagram_attachment(url)
-        else:
-            files, temp_dir = download_public_url(url)
+        # Download every attachment from the same Instagram message before
+        # uploading. This preserves a 2-photo/3-photo/etc. message as one
+        # Telegram media group instead of sending only/separately one item.
+        for url in urls:
+            if "lookaside.fbsbx.com" in url or "fbsbx.com" in url:
+                files, temp_dir = _download_instagram_attachment(url)
+            else:
+                files, temp_dir = download_public_url(url)
+            if temp_dir:
+                temp_dirs.append(temp_dir)
+            all_files.extend(files or [])
 
-        if not files:
-            logger.warning("No media downloaded from Instagram attachment")
+        if not all_files:
+            logger.warning("No media downloaded from Instagram attachments")
             return
-        _send_to_telegram(bot, files, caption=caption)
+        _send_to_telegram(bot, all_files, caption=caption)
     except Exception:
         logger.exception("Instagram media processing failed")
     finally:
-        if temp_dir:
-            import shutil
+        import shutil
+        for temp_dir in temp_dirs:
             shutil.rmtree(temp_dir, ignore_errors=True)
-
-
 def _handle_event(bot, event: dict[str, Any]) -> None:
     messaging = event.get("messaging") or []
     for item in messaging:
@@ -189,13 +195,13 @@ def _handle_event(bot, event: dict[str, Any]) -> None:
             import re
             urls.extend(re.findall(r"https?://[^\s<>\"']+", text))
 
-        for url in dict.fromkeys(urls):
+        unique_urls = list(dict.fromkeys(urls))
+        if unique_urls:
             threading.Thread(
                 target=_download_and_forward,
-                args=(bot, url, None),
+                args=(bot, unique_urls, None),
                 daemon=True,
             ).start()
-
 
 @app.get("/instagram/webhook")
 def verify_webhook():
