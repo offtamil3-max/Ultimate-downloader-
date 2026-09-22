@@ -134,6 +134,22 @@ def receive_webhook():
     return jsonify({"ok": True}), 200
 
 
+@app.get("/privacy-policy")
+def privacy_policy():
+    return """
+    <!doctype html>
+    <html><head><meta charset="utf-8"><title>Privacy Policy - Ultimate Downloader</title></head>
+    <body>
+    <h1>Privacy Policy</h1>
+    <p>Ultimate Downloader processes media that users send to the connected Instagram account and forwards permitted media to the configured Telegram channel.</p>
+    <p>We use the information required to receive and process these messages, including message metadata and media URLs, only to provide the bot's requested functionality.</p>
+    <p>Downloaded media is processed temporarily and is removed from the bot's working storage after processing, subject to platform or hosting logs outside the bot's control.</p>
+    <p>We do not intentionally sell personal information.</p>
+    <p>For privacy questions, contact the app owner through the contact method associated with this application.</p>
+    </body></html>
+    """, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "service": "ultimate-downloader"}), 200
