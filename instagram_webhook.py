@@ -20,7 +20,7 @@ from universal_downloader import download_public_url
 
 logger = logging.getLogger("instagram_webhook")
 
-VERIFY_TOKEN = os.getenv("INSTAGRAM_VERIFY_TOKEN", "")
+VERIFY_TOKEN = os.getenv("INSTAGRAM_VERIFY_TOKEN", "igwh_7f4c2d9a_2026").strip()
 TARGET_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -110,9 +110,9 @@ def _handle_event(bot, event: dict[str, Any]) -> None:
 
 @app.get("/instagram/webhook")
 def verify_webhook():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
+    mode = (request.args.get("hub.mode") or request.args.get("hub_mode") or "").strip()
+    token = (request.args.get("hub.verify_token") or request.args.get("hub_verify_token") or "").strip()
+    challenge = request.args.get("hub.challenge") or request.args.get("hub_challenge")
 
     if mode == "subscribe" and VERIFY_TOKEN and token == VERIFY_TOKEN:
         return challenge or "", 200
