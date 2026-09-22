@@ -342,6 +342,21 @@ def _download_and_forward(
                 or payload.get("id")
             )
 
+            # Meta share attachments can include the original Instagram
+            # permalink in payload.link. For a carousel owned by another
+            # Instagram account, the recipient's Graph token may not be
+            # allowed to read the shared media's children. In that case the
+            # permalink is the supported public fallback and gallery-dl can
+            # expand the carousel.
+            post_link = payload.get("link") or payload.get("permalink_url")
+
+            logger.info(
+                "Instagram attachment: type=%s media_id_present=%s post_link_present=%s",
+                attachment.get("type", "unknown"),
+                bool(media_id),
+                bool(post_link),
+            )
+
             resolved_urls: list[str] = []
             if isinstance(media_id, str) and media_id not in seen_ids:
                 seen_ids.add(media_id)
@@ -354,19 +369,45 @@ def _download_and_forward(
                     )
 
             if resolved_urls:
-                # For an ig_post carousel, Graph API child media URLs are the
-                # complete set. Do NOT also append the webhook's single CDN URL,
-                # otherwise the first item can be duplicated as item 11.
+                # Graph child URLs are the complete carousel set. Do not also
+                # append the webhook's single CDN URL.
                 urls.extend(resolved_urls)
                 direct_urls.update(resolved_urls)
                 continue
 
-            # Fallback for ordinary webhook attachments or Graph failures.
+            if isinstance(post_link, str) and "instagram.com" in post_link:
+                try:
+                    logger.info(
+                        "Instagram Graph returned no media; trying permalink fallback"
+                    )
+                    permalink_files, permalink_dir = download_public_url(post_link)
+                    if permalink_files:
+                        if permalink_dir:
+                            temp_dirs.append(permalink_dir)
+                        all_files.extend(permalink_files)
+                        logger.info(
+                            "Instagram permalink fallback downloaded %d file(s)",
+                            len(permalink_files),
+                        )
+                        continue
+                    if permalink_dir:
+                        shutil.rmtree(permalink_dir, ignore_errors=True)
+                    logger.warning(
+                        "Instagram permalink fallback returned no files"
+                    )
+                except Exception:
+                    logger.exception(
+                        "Instagram permalink fallback failed"
+                    )
+
+            # Final fallback for ordinary webhook attachments or when the
+            # public permalink cannot be extracted.
             media_url = payload.get("url")
             if isinstance(media_url, str) and media_url.startswith(
                 ("http://", "https://")
             ):
                 urls.append(media_url)
+                direct_urls.add(media_url)
 
         unique_urls = list(dict.fromkeys(urls))
         logger.info(
