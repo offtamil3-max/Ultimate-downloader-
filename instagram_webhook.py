@@ -11,6 +11,8 @@ import logging
 import os
 import threading
 from pathlib import Path
+import mimetypes
+import tempfile
 from typing import Any
 
 import requests
@@ -67,12 +69,55 @@ def _send_to_telegram(bot, files: list[Path], caption: str | None = None) -> Non
             logger.exception("Telegram upload failed for %s", f)
 
 
+def _download_instagram_attachment(url: str) -> tuple[list[Path], str | None]:
+    """Download a signed Instagram CDN attachment directly.
+
+    Instagram messaging webhooks can provide a temporary lookaside.fbsbx.com
+    media URL. That URL is already a downloadable media resource, so yt-dlp /
+    gallery-dl are not appropriate for it.
+    """
+    temp_dir = Path(tempfile.mkdtemp(prefix="ig_webhook_"))
+    try:
+        response = requests.get(
+            url,
+            stream=True,
+            timeout=(15, 120),
+            allow_redirects=True,
+            headers={"User-Agent": "UltimateDownloader/1.0"},
+        )
+        response.raise_for_status()
+
+        content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
+        if content_type.startswith("video/"):
+            ext = mimetypes.guess_extension(content_type) or ".mp4"
+        elif content_type.startswith("image/"):
+            ext = mimetypes.guess_extension(content_type) or ".jpg"
+        else:
+            ext = Path(response.url.split("?", 1)[0]).suffix.lower() or ".bin"
+
+        output = temp_dir / f"instagram_media{ext}"
+        with output.open("wb") as fh:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    fh.write(chunk)
+
+        return [output], str(temp_dir)
+    except Exception:
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+
 def _download_and_forward(bot, url: str, caption: str | None = None) -> None:
     temp_dir = None
     try:
-        files, temp_dir = download_public_url(url)
+        if "lookaside.fbsbx.com" in url or "fbsbx.com" in url:
+            files, temp_dir = _download_instagram_attachment(url)
+        else:
+            files, temp_dir = download_public_url(url)
+
         if not files:
-            logger.warning("No media downloaded from Instagram attachment: %s", url)
+            logger.warning("No media downloaded from Instagram attachment")
             return
         _send_to_telegram(bot, files, caption=caption)
     except Exception:
