@@ -213,12 +213,81 @@ def _graph_media_urls(media_id: str) -> list[str]:
             ):
                 urls.append(media_url)
     else:
+        # Log Meta's actual error without logging the access token or full URL.
+        try:
+            error_body = children_response.json().get("error", {})
+            error_message = (
+                error_body.get("message")
+                or error_body.get("error_user_msg")
+                or children_response.text[:300]
+            )
+            error_code = error_body.get("code")
+            error_type = error_body.get("type")
+        except Exception:
+            error_message = children_response.text[:300]
+            error_code = None
+            error_type = None
+
         logger.warning(
-            "Instagram /children lookup failed for %s: HTTP %s: %s",
+            "Instagram /children lookup failed for media %s: HTTP %s code=%s type=%s message=%s",
             media_id,
             children_response.status_code,
-            children_response.text[:300],
+            error_code,
+            error_type,
+            error_message,
         )
+
+        # Compatibility fallback for integrations where the media object is
+        # exposed through the Facebook Graph hostname.
+        try:
+            fb_children_response = requests.get(
+                f"https://graph.facebook.com/{GRAPH_VERSION}/{media_id}/children",
+                params={
+                    "fields": "id,media_type,media_url",
+                    "access_token": INSTAGRAM_ACCESS_TOKEN,
+                    "limit": 100,
+                },
+                timeout=(15, 30),
+            )
+            if fb_children_response.ok:
+                fb_children_data = fb_children_response.json()
+                for child in fb_children_data.get("data", []):
+                    if not isinstance(child, dict):
+                        continue
+                    media_url = child.get("media_url")
+                    if isinstance(media_url, str) and media_url.startswith(
+                        ("http://", "https://")
+                    ):
+                        urls.append(media_url)
+                logger.info(
+                    "Instagram Facebook-Graph fallback returned %d child URL(s) for %s",
+                    len(urls),
+                    media_id,
+                )
+            else:
+                try:
+                    fb_error = fb_children_response.json().get("error", {})
+                    fb_message = (
+                        fb_error.get("message")
+                        or fb_error.get("error_user_msg")
+                        or fb_children_response.text[:200]
+                    )
+                    fb_code = fb_error.get("code")
+                except Exception:
+                    fb_message = fb_children_response.text[:200]
+                    fb_code = None
+                logger.warning(
+                    "Instagram Facebook-Graph /children fallback failed for media %s: HTTP %s code=%s message=%s",
+                    media_id,
+                    fb_children_response.status_code,
+                    fb_code,
+                    fb_message,
+                )
+        except Exception:
+            logger.exception(
+                "Instagram Facebook-Graph /children fallback errored for media %s",
+                media_id,
+            )
 
     # If there are no children, resolve the media itself. This handles a
     # normal photo/reel and also gives a useful fallback when /children is
