@@ -17,6 +17,7 @@ from typing import Any
 
 import requests
 from flask import Flask, jsonify, request
+from telebot import types as tg_types
 
 from universal_downloader import download_public_url
 
@@ -56,19 +57,58 @@ def _send_to_telegram(bot, files: list[Path], caption: str | None = None) -> Non
         logger.error("TELEGRAM_CHANNEL_ID is not configured")
         return
 
+    # Telegram supports up to 10 photos/videos in one media group. Preserve
+    # Instagram multi-attachment messages instead of concurrent sends.
+    media_exts = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mkv", ".webm", ".mov", ".avi"}
+    media_files = [f for f in files if f.suffix.lower() in media_exts]
+
+    for start in range(0, len(media_files), 10):
+        chunk = media_files[start:start + 10]
+        handles = []
+        media = []
+        try:
+            for index, f in enumerate(chunk):
+                fh = f.open("rb")
+                handles.append(fh)
+                item_caption = caption if start == 0 and index == 0 else None
+                if f.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".avi"}:
+                    media.append(tg_types.InputMediaVideo(fh, caption=item_caption))
+                else:
+                    media.append(tg_types.InputMediaPhoto(fh, caption=item_caption))
+
+            if len(media) == 1:
+                if f.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".avi"}:
+                    bot.send_video(TARGET_CHANNEL_ID, handles[0], caption=caption)
+                else:
+                    bot.send_photo(TARGET_CHANNEL_ID, handles[0], caption=caption)
+            else:
+                bot.send_media_group(TARGET_CHANNEL_ID, media)
+        except Exception:
+            logger.exception("Telegram media group upload failed for %s", chunk)
+            for f in chunk:
+                try:
+                    with f.open("rb") as fh:
+                        if f.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".avi"}:
+                            bot.send_video(TARGET_CHANNEL_ID, fh, caption=caption)
+                        else:
+                            bot.send_photo(TARGET_CHANNEL_ID, fh, caption=caption)
+                except Exception:
+                    logger.exception("Telegram individual upload failed for %s", f)
+        finally:
+            for fh in handles:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+
     for f in files:
+        if f in media_files:
+            continue
         try:
             with f.open("rb") as fh:
-                if f.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".avi"}:
-                    bot.send_video(TARGET_CHANNEL_ID, fh, caption=caption)
-                elif f.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
-                    bot.send_photo(TARGET_CHANNEL_ID, fh, caption=caption)
-                else:
-                    bot.send_document(TARGET_CHANNEL_ID, fh, caption=caption)
+                bot.send_document(TARGET_CHANNEL_ID, fh, caption=caption)
         except Exception:
-            logger.exception("Telegram upload failed for %s", f)
-
-
+            logger.exception("Telegram document upload failed for %s", f)
 def _download_instagram_attachment(url: str) -> tuple[list[Path], str | None]:
     """Download a signed Instagram CDN attachment directly.
 
