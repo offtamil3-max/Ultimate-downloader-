@@ -289,25 +289,65 @@ def _graph_media_urls(media_id: str) -> list[str]:
                 media_id,
             )
 
-    # If there are no children, resolve the media itself. This handles a
-    # normal photo/reel and also gives a useful fallback when /children is
-    # unavailable for a particular media object.
+    # If /children did not resolve anything, first ask only for media_type.
+    # A CAROUSEL_ALBUM parent has no media_url field, so requesting
+    # media_url on the parent can itself produce HTTP 400.
     if not urls:
-        media_response = requests.get(
-            f"https://graph.instagram.com/{GRAPH_VERSION}/{media_id}",
-            params={
-                "fields": "id,media_type,media_url",
-                "access_token": INSTAGRAM_ACCESS_TOKEN,
-            },
-            timeout=(15, 30),
-        )
-        media_response.raise_for_status()
-        data = media_response.json()
-        media_url = data.get("media_url")
-        if isinstance(media_url, str) and media_url.startswith(
-            ("http://", "https://")
-        ):
-            urls.append(media_url)
+        try:
+            type_response = requests.get(
+                f"https://graph.instagram.com/{GRAPH_VERSION}/{media_id}",
+                params={
+                    "fields": "id,media_type",
+                    "access_token": INSTAGRAM_ACCESS_TOKEN,
+                },
+                timeout=(15, 30),
+            )
+            if type_response.ok:
+                media_type = type_response.json().get("media_type", "")
+                logger.info(
+                    "Instagram Graph media %s type=%s",
+                    media_id,
+                    media_type,
+                )
+
+                if media_type == "CAROUSEL_ALBUM":
+                    logger.info(
+                        "Instagram Graph media %s is a carousel; /children did not resolve it",
+                        media_id,
+                    )
+                else:
+                    media_response = requests.get(
+                        f"https://graph.instagram.com/{GRAPH_VERSION}/{media_id}",
+                        params={
+                            "fields": "id,media_type,media_url",
+                            "access_token": INSTAGRAM_ACCESS_TOKEN,
+                        },
+                        timeout=(15, 30),
+                    )
+                    if media_response.ok:
+                        data = media_response.json()
+                        media_url = data.get("media_url")
+                        if isinstance(media_url, str) and media_url.startswith(
+                            ("http://", "https://")
+                        ):
+                            urls.append(media_url)
+                    else:
+                        logger.warning(
+                            "Instagram Graph media_url lookup failed for media %s: HTTP %s",
+                            media_id,
+                            media_response.status_code,
+                        )
+            else:
+                logger.warning(
+                    "Instagram Graph media_type lookup failed for media %s: HTTP %s",
+                    media_id,
+                    type_response.status_code,
+                )
+        except Exception:
+            logger.exception(
+                "Instagram Graph parent lookup failed for media %s",
+                media_id,
+            )
 
     logger.info(
         "Instagram Graph media %s resolved to %d media URL(s)",
