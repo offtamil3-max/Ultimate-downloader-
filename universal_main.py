@@ -14,6 +14,7 @@ from telebot import types
 
 import main as existing
 from universal_downloader import download_public_url, extract_http_url
+from instagram_webhook import start_instagram_webhook
 
 logger = logging.getLogger("universal_bot")
 
@@ -110,4 +111,5 @@ def universal_channel_handler(message: types.Message):
 if __name__ == "__main__":
     logger.info("Starting Ultimate Downloader Bot with universal fallback...")
     Path(existing.DOWNLOAD_ROOT).mkdir(exist_ok=True)
+    start_instagram_webhook(bot)
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
