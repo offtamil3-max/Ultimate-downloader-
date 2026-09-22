@@ -187,31 +187,53 @@ def _graph_media_urls(media_id: str) -> list[str]:
         )
         return []
 
-    fields = "id,media_type,media_url,children{id,media_type,media_url}"
-    response = requests.get(
-        f"https://graph.instagram.com/{GRAPH_VERSION}/{media_id}",
+    urls: list[str] = []
+
+    # Carousel children are exposed through the /children edge. Asking for
+    # children as a nested field on the parent media endpoint can return HTTP
+    # 400 for Instagram Login tokens, so use the dedicated edge first.
+    children_response = requests.get(
+        f"https://graph.instagram.com/{GRAPH_VERSION}/{media_id}/children",
         params={
-            "fields": fields,
+            "fields": "id,media_type,media_url",
             "access_token": INSTAGRAM_ACCESS_TOKEN,
+            "limit": 100,
         },
         timeout=(15, 30),
     )
-    response.raise_for_status()
 
-    data = response.json()
-    urls: list[str] = []
+    if children_response.ok:
+        children_data = children_response.json()
+        for child in children_data.get("data", []):
+            if not isinstance(child, dict):
+                continue
+            media_url = child.get("media_url")
+            if isinstance(media_url, str) and media_url.startswith(
+                ("http://", "https://")
+            ):
+                urls.append(media_url)
+    else:
+        logger.warning(
+            "Instagram /children lookup failed for %s: HTTP %s: %s",
+            media_id,
+            children_response.status_code,
+            children_response.text[:300],
+        )
 
-    for child in (data.get("children") or {}).get("data", []):
-        if not isinstance(child, dict):
-            continue
-        media_url = child.get("media_url")
-        if isinstance(media_url, str) and media_url.startswith(
-            ("http://", "https://")
-        ):
-            urls.append(media_url)
-
-    # Non-carousel media has no children; use its own media_url.
+    # If there are no children, resolve the media itself. This handles a
+    # normal photo/reel and also gives a useful fallback when /children is
+    # unavailable for a particular media object.
     if not urls:
+        media_response = requests.get(
+            f"https://graph.instagram.com/{GRAPH_VERSION}/{media_id}",
+            params={
+                "fields": "id,media_type,media_url",
+                "access_token": INSTAGRAM_ACCESS_TOKEN,
+            },
+            timeout=(15, 30),
+        )
+        media_response.raise_for_status()
+        data = media_response.json()
         media_url = data.get("media_url")
         if isinstance(media_url, str) and media_url.startswith(
             ("http://", "https://")
