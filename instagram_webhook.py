@@ -234,6 +234,7 @@ def _download_and_forward(
 
     try:
         urls: list[str] = []
+        direct_urls: set[str] = set()
         seen_ids: set[str] = set()
 
         for attachment in attachments:
@@ -266,6 +267,7 @@ def _download_and_forward(
                 # complete set. Do NOT also append the webhook's single CDN URL,
                 # otherwise the first item can be duplicated as item 11.
                 urls.extend(resolved_urls)
+                direct_urls.update(resolved_urls)
                 continue
 
             # Fallback for ordinary webhook attachments or Graph failures.
@@ -282,7 +284,7 @@ def _download_and_forward(
         )
 
         for url in unique_urls:
-            if "fbsbx.com" in url:
+            if url in direct_urls or "fbsbx.com" in url or "cdninstagram.com" in url or "scontent" in url:
                 files, temp_dir = _download_instagram_attachment(url)
             else:
                 files, temp_dir = download_public_url(url)
