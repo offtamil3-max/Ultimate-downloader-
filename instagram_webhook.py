@@ -215,131 +215,67 @@ def _instagram_token_ok() -> bool:
     return False
 
 
-def _graph_media_urls(media_id: str) -> list[str]:
-    """Resolve an Instagram media ID, expanding carousel children."""
-    if not INSTAGRAM_ACCESS_TOKEN:
-        logger.warning(
-            "INSTAGRAM_ACCESS_TOKEN is not configured; cannot resolve media ID %s",
-            media_id,
-        )
-        return []
+def _graph_attachment_edge(message_id: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """Try the message attachments edge instead of the media /children edge."""
+    if not INSTAGRAM_ACCESS_TOKEN or not message_id:
+        return [], []
 
-    urls: list[str] = []
+    endpoints = [
+        f"https://graph.instagram.com/{GRAPH_VERSION}/{message_id}/attachments",
+        f"https://graph.facebook.com/{GRAPH_VERSION}/{message_id}/attachments",
+    ]
 
-    # Carousel children are exposed through the /children edge. Asking for
-    # children as a nested field on the parent media endpoint can return HTTP
-    # 400 for Instagram Login tokens, so use the dedicated edge first.
-    children_response = requests.get(
-        f"https://graph.instagram.com/{GRAPH_VERSION}/{media_id}/children",
-        params={
-            "fields": "id,media_type,media_url",
-            "access_token": INSTAGRAM_ACCESS_TOKEN,
-            "limit": 100,
-        },
-        timeout=(15, 30),
-    )
+    def collect(value: Any, recovered: list[dict[str, Any]], links: list[str]) -> None:
+        if isinstance(value, list):
+            for item in value:
+                collect(item, recovered, links)
+            return
+        if not isinstance(value, dict):
+            return
+        payload = value.get("payload")
+        if isinstance(payload, dict):
+            recovered.append({"payload": payload, "type": value.get("type")})
+            for key in ("link", "url", "permalink", "permalink_url"):
+                v = payload.get(key)
+                if isinstance(v, str) and "instagram.com" in v:
+                    links.append(v)
+        for key in ("link", "url", "permalink", "permalink_url"):
+            v = value.get(key)
+            if isinstance(v, str) and "instagram.com" in v:
+                links.append(v)
+        for key in ("data", "attachments", "shares", "elements"):
+            if key in value:
+                collect(value[key], recovered, links)
 
-    if children_response.ok:
-        children_data = children_response.json()
-        for child in children_data.get("data", []):
-            if not isinstance(child, dict):
-                continue
-            media_url = child.get("media_url")
-            if isinstance(media_url, str) and media_url.startswith(
-                ("http://", "https://")
-            ):
-                urls.append(media_url)
-    else:
-        # Log Meta's actual error without logging the access token or full URL.
-        try:
-            error_body = children_response.json().get("error", {})
-            error_message = (
-                error_body.get("message")
-                or error_body.get("error_user_msg")
-                or children_response.text[:300]
-            )
-            error_code = error_body.get("code")
-            error_type = error_body.get("type")
-        except Exception:
-            error_message = children_response.text[:300]
-            error_code = None
-            error_type = None
-
-        logger.warning(
-            "Instagram /children lookup failed for media %s: HTTP %s code=%s type=%s message=%s",
-            media_id,
-            children_response.status_code,
-            error_code,
-            error_type,
-            error_message,
-        )
-
-    # If /children did not resolve anything, first ask only for media_type.
-    # A CAROUSEL_ALBUM parent has no media_url field, so requesting
-    # media_url on the parent can itself produce HTTP 400.
-    if not urls:
-        try:
-            type_response = requests.get(
-                f"https://graph.instagram.com/{GRAPH_VERSION}/{media_id}",
-                params={
-                    "fields": "id,media_type",
-                    "access_token": INSTAGRAM_ACCESS_TOKEN,
-                },
-                timeout=(15, 30),
-            )
-            if type_response.ok:
-                media_type = type_response.json().get("media_type", "")
-                logger.info(
-                    "Instagram Graph media %s type=%s",
-                    media_id,
-                    media_type,
+    for endpoint in endpoints:
+        for fields in ("id,type,payload,link,url,title", "id,type,payload", "id,type"):
+            try:
+                response = requests.get(
+                    endpoint,
+                    params={
+                        "fields": fields,
+                        "platform": "instagram",
+                        "access_token": INSTAGRAM_ACCESS_TOKEN,
+                    },
+                    timeout=(15, 30),
                 )
-
-                if media_type == "CAROUSEL_ALBUM":
+                if not response.ok:
+                    continue
+                recovered: list[dict[str, Any]] = []
+                links: list[str] = []
+                collect(response.json(), recovered, links)
+                links=list(dict.fromkeys(links))
+                if recovered or links:
                     logger.info(
-                        "Instagram Graph media %s is a carousel; /children did not resolve it",
-                        media_id,
+                        "Instagram message attachments edge recovered %d attachment record(s) and %d permalink(s)",
+                        len(recovered), len(links),
                     )
-                else:
-                    media_response = requests.get(
-                        f"https://graph.instagram.com/{GRAPH_VERSION}/{media_id}",
-                        params={
-                            "fields": "id,media_type,media_url",
-                            "access_token": INSTAGRAM_ACCESS_TOKEN,
-                        },
-                        timeout=(15, 30),
-                    )
-                    if media_response.ok:
-                        data = media_response.json()
-                        media_url = data.get("media_url")
-                        if isinstance(media_url, str) and media_url.startswith(
-                            ("http://", "https://")
-                        ):
-                            urls.append(media_url)
-                    else:
-                        logger.warning(
-                            "Instagram Graph media_url lookup failed for media %s: HTTP %s",
-                            media_id,
-                            media_response.status_code,
-                        )
-            else:
-                logger.warning(
-                    "Instagram Graph media_type lookup failed for media %s: HTTP %s",
-                    media_id,
-                    type_response.status_code,
-                )
-        except Exception:
-            logger.exception(
-                "Instagram Graph parent lookup failed for media %s",
-                media_id,
-            )
+                    return recovered, links
+            except Exception:
+                logger.exception("Instagram message attachments edge lookup errored")
 
-    logger.info(
-        "Instagram Graph media %s resolved to %d media URL(s)",
-        media_id,
-        len(urls),
-    )
-    return urls
+    logger.info("Instagram message attachments edge returned no richer share metadata")
+    return [], []
 
 
 def _graph_message_details(message_id: str, ig_user_id: str | None = None, sender_id: str | None = None) -> tuple[list[dict[str, Any]], list[str]]:
@@ -348,6 +284,10 @@ def _graph_message_details(message_id: str, ig_user_id: str | None = None, sende
         return [], []
 
     fields = "id,attachments,shares,message"
+    edge_recovered, edge_links = _graph_attachment_edge(message_id)
+    if edge_recovered or edge_links:
+        return edge_recovered, edge_links
+
     # Instagram Login tokens are for graph.instagram.com.
     endpoints = [
         f"https://graph.instagram.com/{GRAPH_VERSION}/{message_id}",
@@ -527,23 +467,12 @@ def _download_and_forward(
                 bool(post_link),
             )
 
-            resolved_urls: list[str] = []
             if isinstance(media_id, str) and media_id not in seen_ids:
                 seen_ids.add(media_id)
-                try:
-                    resolved_urls = _graph_media_urls(media_id)
-                except Exception:
-                    logger.exception(
-                        "Instagram Graph media lookup failed for %s",
-                        media_id,
-                    )
-
-            if resolved_urls:
-                # Graph child URLs are the complete carousel set. Do not also
-                # append the webhook's single CDN URL.
-                urls.extend(resolved_urls)
-                direct_urls.update(resolved_urls)
-                continue
+                logger.info(
+                    "Instagram share media_id=%s; skipping media /children lookup",
+                    media_id,
+                )
 
             if isinstance(post_link, str) and "instagram.com" in post_link:
                 try:
@@ -570,43 +499,42 @@ def _download_and_forward(
                         "Instagram permalink fallback failed"
                     )
 
-            # New ig_post webhooks may omit the public permalink entirely.
-            # The numeric ig_post_media_id can be converted to Instagram's
-            # public shortcode, so try the public post URL before falling back
-            # to the single signed CDN attachment. This is especially useful
-            # for carousel posts whose /children edge is inaccessible to the
-            # recipient's API token.
-            if (
-                isinstance(media_id, str)
-                and not isinstance(post_link, str)
-                and "instagram.com" not in str(post_link)
-            ):
-                shortcode = _media_id_to_shortcode(media_id)
-                if shortcode:
-                    derived_link = f"https://www.instagram.com/p/{shortcode}/"
-                    try:
+            # Try resolving the signed lookaside URL through an HTTP redirect.
+            # If Meta redirects it to a public Instagram URL, gallery-dl can
+            # expand the complete carousel without the media /children edge.
+            media_url = payload.get("url")
+            if isinstance(media_url, str) and media_url.startswith(("http://", "https://")):
+                try:
+                    redirect_response = requests.head(
+                        media_url,
+                        allow_redirects=True,
+                        timeout=(15, 20),
+                        headers={"User-Agent": "UltimateDownloader/1.0"},
+                    )
+                    final_url = redirect_response.url or ""
+                    if "instagram.com/" in final_url and final_url != media_url:
+                        public_url = final_url.split("?", 1)[0]
                         logger.info(
-                            "Instagram permalink absent; trying media-ID derived public URL"
+                            "Instagram CDN redirected to public URL: %s",
+                            public_url,
                         )
-                        permalink_files, permalink_dir = download_public_url(derived_link)
+                        permalink_files, permalink_dir = download_public_url(public_url)
                         if permalink_files:
                             if permalink_dir:
                                 temp_dirs.append(permalink_dir)
                             all_files.extend(permalink_files)
                             logger.info(
-                                "Instagram media-ID permalink fallback downloaded %d file(s)",
+                                "Instagram redirect fallback downloaded %d file(s)",
                                 len(permalink_files),
                             )
                             continue
                         if permalink_dir:
                             shutil.rmtree(permalink_dir, ignore_errors=True)
-                        logger.warning(
-                            "Instagram media-ID permalink fallback returned no files"
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Instagram media-ID permalink fallback failed"
-                        )
+                except Exception:
+                    logger.debug(
+                        "Instagram CDN redirect/public URL resolution failed",
+                        exc_info=True,
+                    )
 
             # Final fallback for ordinary webhook attachments or when the
             # public permalink cannot be extracted.
