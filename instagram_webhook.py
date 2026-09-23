@@ -12,6 +12,7 @@ import hmac
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import tempfile
 import threading
