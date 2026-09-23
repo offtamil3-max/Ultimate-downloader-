@@ -31,6 +31,12 @@ ACCEPTED_VERIFY_TOKENS = {
 }
 TARGET_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN", "").strip()
+INSTAGRAM_SESSION_COOKIE = os.getenv("INSTAGRAM_SESSION_COOKIE", "").strip()
+INSTAGRAM_CSRF_TOKEN = os.getenv("INSTAGRAM_CSRF_TOKEN", "").strip()
+INSTAGRAM_WWW_CLAIM = os.getenv("INSTAGRAM_WWW_CLAIM", "").strip()
+COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip() or ("cookies.txt" if Path("cookies.txt").exists() else "")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://ultimate-downloader-production.up.railway.app").strip().rstrip("/")
 GRAPH_VERSION = os.getenv("INSTAGRAM_GRAPH_VERSION", "v26.0").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -215,85 +221,141 @@ def _instagram_token_ok() -> bool:
     return False
 
 
-def _instagram_mobile_media_urls(media_id: str) -> list[str]:
-    """Resolve shared media through Instagram's mobile media-info endpoint.
+def _instagram_cookie_header() -> str:
+    """Build an Instagram cookie header from an explicit session cookie or cookies.txt."""
+    if INSTAGRAM_SESSION_COOKIE:
+        return INSTAGRAM_SESSION_COOKIE
 
-    This is intentionally separate from the Graph API /children edge. The
-    Messaging webhook gives us the original numeric media ID, and Instagram's
-    own media-info endpoint can return carousel_media for that ID.
+    if not COOKIES_FILE:
+        return ""
+
+    try:
+        from http.cookiejar import MozillaCookieJar
+
+        jar = MozillaCookieJar(COOKIES_FILE)
+        jar.load(ignore_discard=True, ignore_expires=True)
+        pairs = []
+        for cookie in jar:
+            domain = (cookie.domain or "").lower()
+            if "instagram.com" in domain:
+                pairs.append(f"{cookie.name}={cookie.value}")
+        return "; ".join(pairs)
+    except Exception:
+        logger.debug("Could not load Instagram cookies from %s", COOKIES_FILE, exc_info=True)
+        return ""
+
+
+def _instagram_mobile_headers(host: str) -> dict[str, str]:
+    cookie = _instagram_cookie_header()
+    headers = {
+        "Accept": "*/*",
+        "X-IG-App-ID": "936619743392459",
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 10; SM-G981B) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.162 "
+            "Mobile Safari/537.36 Instagram 390.0.0.0.74 Android "
+            "(30/11; 420dpi; 1080x2400; samsung; SM-G991B; o1s; "
+            "exynos2100; en_US; 300000000)"
+        ),
+        "Referer": "https://www.instagram.com/",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    if INSTAGRAM_CSRF_TOKEN:
+        headers["X-CSRFToken"] = INSTAGRAM_CSRF_TOKEN
+    if INSTAGRAM_WWW_CLAIM:
+        headers["X-IG-WWW-Claim"] = INSTAGRAM_WWW_CLAIM
+    if host == "www.instagram.com":
+        headers["X-Requested-With"] = "XMLHttpRequest"
+    return headers
+
+
+def _instagram_mobile_media_urls(media_id: str) -> list[str]:
+    """Resolve a shared post through Instagram's media-info API.
+
+    Instagram has recently returned 403 from the i.instagram.com mobile
+    endpoint when no authenticated web session is present. Try the current
+    www endpoint first, then the mobile host, and reuse the optional
+    Instagram cookies already supplied to the downloader.
     """
     if not media_id or not media_id.isdigit():
         return []
 
-    try:
-        response = requests.get(
-            f"https://i.instagram.com/api/v1/media/{media_id}/info/",
-            headers={
-                "X-IG-App-ID": "936619743392459",
-                "User-Agent": (
-                    "Instagram 390.0.0.0.74 Android "
-                    "(30/11; 420dpi; 1080x2400; samsung; SM-G991B; "
-                    "o1s; exynos2100; en_US; 300000000)"
-                ),
-                "Accept": "*/*",
-            },
-            timeout=(15, 30),
-        )
-        if not response.ok:
-            logger.info(
-                "Instagram mobile media-info lookup failed: HTTP %s",
-                response.status_code,
+    endpoints = [
+        f"https://www.instagram.com/api/v1/media/{media_id}/info/",
+        f"https://i.instagram.com/api/v1/media/{media_id}/info/",
+    ]
+
+    for endpoint in endpoints:
+        host = "www.instagram.com" if "www.instagram.com" in endpoint else "i.instagram.com"
+        try:
+            response = requests.get(
+                endpoint,
+                headers=_instagram_mobile_headers(host),
+                timeout=(15, 30),
             )
-            return []
-
-        data = response.json()
-        items = data.get("items") or []
-        if not items or not isinstance(items[0], dict):
-            return []
-
-        item = items[0]
-        media_items = item.get("carousel_media")
-        if not isinstance(media_items, list):
-            media_items = [item]
-
-        urls: list[str] = []
-
-        for media in media_items:
-            if not isinstance(media, dict):
+            if not response.ok:
+                logger.info(
+                    "Instagram media-info lookup failed host=%s HTTP %s cookie_present=%s",
+                    host,
+                    response.status_code,
+                    bool(_instagram_cookie_header()),
+                )
                 continue
 
-            videos = media.get("video_versions") or []
-            if isinstance(videos, list):
-                for candidate in videos:
-                    if isinstance(candidate, dict):
-                        url = candidate.get("url")
-                        if isinstance(url, str) and url.startswith(("http://", "https://")):
-                            urls.append(url)
-                            break
-
-            if urls and urls[-1].startswith(("http://", "https://")) and media.get("video_versions"):
+            data = response.json()
+            items = data.get("items") or []
+            if not items or not isinstance(items[0], dict):
                 continue
 
-            images = media.get("image_versions2", {}).get("candidates", [])
-            if isinstance(images, list):
-                for candidate in images:
-                    if isinstance(candidate, dict):
-                        url = candidate.get("url")
-                        if isinstance(url, str) and url.startswith(("http://", "https://")):
-                            urls.append(url)
-                            break
+            item = items[0]
+            media_items = item.get("carousel_media")
+            if not isinstance(media_items, list):
+                media_items = [item]
 
-        urls = list(dict.fromkeys(urls))
-        logger.info(
-            "Instagram mobile media-info resolved %d media URL(s), carousel=%s",
-            len(urls),
-            len(media_items) > 1,
-        )
-        return urls
-    except Exception:
-        logger.exception("Instagram mobile media-info lookup errored")
-        return []
+            urls: list[str] = []
+            for media in media_items:
+                if not isinstance(media, dict):
+                    continue
 
+                videos = media.get("video_versions") or []
+                found_video = False
+                if isinstance(videos, list):
+                    for candidate in videos:
+                        if isinstance(candidate, dict):
+                            url = candidate.get("url")
+                            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                                urls.append(url)
+                                found_video = True
+                                break
+
+                if found_video:
+                    continue
+
+                image_versions = media.get("image_versions2") or {}
+                images = image_versions.get("candidates", []) if isinstance(image_versions, dict) else []
+                if isinstance(images, list):
+                    for candidate in images:
+                        if isinstance(candidate, dict):
+                            url = candidate.get("url")
+                            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                                urls.append(url)
+                                break
+
+            urls = list(dict.fromkeys(urls))
+            if urls:
+                logger.info(
+                    "Instagram media-info resolved %d media URL(s), carousel=%s host=%s cookie_present=%s",
+                    len(urls),
+                    len(media_items) > 1,
+                    host,
+                    bool(_instagram_cookie_header()),
+                )
+                return urls
+        except Exception:
+            logger.exception("Instagram media-info lookup errored host=%s", host)
+
+    return []
 
 def _graph_attachment_edge(message_id: str) -> tuple[list[dict[str, Any]], list[str]]:
     """Try the message attachments edge instead of the media /children edge."""
@@ -784,6 +846,28 @@ def receive_webhook():
     return jsonify({"ok": True}), 200
 
 
+@app.post("/telegram/webhook")
+def receive_telegram_webhook():
+    """Receive Telegram updates over HTTPS instead of getUpdates polling."""
+    bot = app.config.get("telegram_bot")
+    if bot is None:
+        return jsonify({"ok": False, "error": "Telegram bot not initialized"}), 503
+
+    if TELEGRAM_WEBHOOK_SECRET:
+        provided = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if provided != TELEGRAM_WEBHOOK_SECRET:
+            return jsonify({"ok": False, "error": "Forbidden"}), 403
+
+    try:
+        update = tg_types.Update.de_json(request.data.decode("utf-8"))
+        if update is not None:
+            bot.process_new_updates([update])
+        return jsonify({"ok": True}), 200
+    except Exception:
+        logger.exception("Telegram webhook update processing failed")
+        return jsonify({"ok": False}), 500
+
+
 @app.get("/privacy-policy")
 def privacy_policy():
     return (
@@ -851,6 +935,26 @@ def start_instagram_webhook(bot) -> None:
         _instagram_token_ok()
 
     app.config["telegram_bot"] = bot
+
+    # Telegram webhooks and getUpdates are mutually exclusive. Using the
+    # webhook removes the recurring 409 conflict when another instance is
+    # still polling the same bot token.
+    telegram_webhook_url = f"{PUBLIC_BASE_URL}/telegram/webhook"
+    try:
+        if TELEGRAM_WEBHOOK_SECRET:
+            bot.set_webhook(
+                url=telegram_webhook_url,
+                secret_token=TELEGRAM_WEBHOOK_SECRET,
+                drop_pending_updates=False,
+            )
+        else:
+            bot.set_webhook(
+                url=telegram_webhook_url,
+                drop_pending_updates=False,
+            )
+        logger.info("Telegram webhook configured: %s", telegram_webhook_url)
+    except Exception:
+        logger.exception("Failed to configure Telegram webhook")
 
     thread = threading.Thread(
         target=lambda: app.run(
