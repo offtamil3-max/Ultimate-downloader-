@@ -242,3 +242,99 @@ try:
     logger.info("Instagram web carousel compatibility patch loaded")
 except Exception:
     logger.debug("Instagram web carousel compatibility patch not loaded", exc_info=True)
+
+# Meta's signed Instagram attachment endpoint can occasionally return the
+# public post HTML instead of the media bytes. Do not forward that HTML as a
+# .bin document; extract its canonical post URL and hand that URL to the
+# existing gallery-dl/yt-dlp resolver so carousels are expanded normally.
+try:
+    _mod = __import__("instagram_webhook")
+    _original_attachment = getattr(_mod, "_download_instagram_attachment", None)
+    _download_public_url = getattr(_mod, "download_public_url", None)
+
+    def _html_attachment_fallback(url: str):
+        if not callable(_original_attachment):
+            return [], None
+
+        files, temp_dir = _original_attachment(url)
+        if not files:
+            return files, temp_dir
+
+        html_files = []
+        for path in files:
+            try:
+                if path.suffix.lower() in {".html", ".htm", ".bin"}:
+                    head = path.read_bytes()[:2048].lower()
+                    if (
+                        b"<!doctype html" in head
+                        or b"<html" in head
+                        or b"<meta " in head
+                    ):
+                        html_files.append(path)
+            except Exception:
+                pass
+
+        if not html_files:
+            return files, temp_dir
+
+        try:
+            from html import unescape
+
+            html_text = html_files[0].read_text(errors="ignore")
+            candidates = []
+
+            patterns = (
+                r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)',
+                r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\']([^"\']+)',
+            )
+            for pattern in patterns:
+                for match in re.findall(pattern, html_text, flags=re.I):
+                    value = unescape(match).strip()
+                    if "instagram.com/" in value:
+                        candidates.append(value.split("?", 1)[0])
+
+            candidates = list(dict.fromkeys(candidates))
+            if candidates and callable(_download_public_url):
+                logger.info(
+                    "Instagram CDN returned HTML; canonical post URL recovered: %s",
+                    candidates[0],
+                )
+                for candidate in candidates:
+                    try:
+                        resolved_files, resolved_dir = _download_public_url(candidate)
+                        if resolved_files:
+                            if temp_dir:
+                                import shutil
+                                shutil.rmtree(temp_dir, ignore_errors=True)
+                            logger.info(
+                                "Instagram HTML canonical fallback downloaded %d file(s)",
+                                len(resolved_files),
+                            )
+                            return resolved_files, resolved_dir
+                        if resolved_dir:
+                            import shutil
+                            shutil.rmtree(resolved_dir, ignore_errors=True)
+                    except Exception:
+                        logger.debug(
+                            "Instagram HTML canonical fallback failed for %s",
+                            candidate,
+                            exc_info=True,
+                        )
+        except Exception:
+            logger.exception("Instagram HTML attachment parsing failed")
+
+        # Never forward an HTML error/page as instagram_media.bin.
+        if temp_dir:
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.warning(
+            "Instagram attachment was HTML and no downloadable canonical post was recovered"
+        )
+        return [], None
+
+    if callable(_original_attachment):
+        _mod._download_instagram_attachment = _html_attachment_fallback
+        logger.info("Instagram HTML attachment fallback patch loaded")
+except Exception:
+    logger.debug("Instagram HTML attachment fallback patch not loaded", exc_info=True)
+
