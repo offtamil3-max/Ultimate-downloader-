@@ -19,6 +19,7 @@ URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
 
 DOWNLOAD_ROOT = Path(os.getenv("DOWNLOAD_ROOT", "downloads"))
 TOOL_TIMEOUT = int(os.getenv("TOOL_TIMEOUT", "120"))
+COBALT_ENDPOINTS = [os.getenv("COBALT_API_URL", "https://api.cobalt.tools/").strip(), "https://co.wuk.sh/api/json"]
 COOKIES_FROM_BROWSER = os.getenv("COOKIES_FROM_BROWSER", "")
 COOKIES_FILE = os.getenv("COOKIES_FILE", "")
 COOKIES_CONTENT = os.getenv("COOKIES_CONTENT", "")
@@ -84,6 +85,56 @@ def _run_yt_dlp(url: str, folder: Path) -> list[Path]:
     return []
 
 
+def _run_cobalt(url: str, folder: Path) -> list[Path]:
+    """Use Cobalt API before the local extractors."""
+    import requests
+    payload = {
+        "url": url, "vCodec": "h264", "vQuality": "1080",
+        "aFormat": "mp3", "filenameStyle": "basic",
+        "isAudioOnly": False, "disableMetadata": True,
+    }
+    for endpoint in COBALT_ENDPOINTS:
+        if not endpoint:
+            continue
+        try:
+            api_url = endpoint.rstrip("/") + ("" if endpoint.rstrip("/").endswith("/api/json") else "/")
+            r = requests.post(
+                api_url, json=payload,
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                timeout=45,
+            )
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            if data.get("status") in {"error", "rate-limit"}:
+                continue
+            urls = []
+            if data.get("status") == "picker":
+                urls = [x.get("url") for x in (data.get("picker") or []) if isinstance(x, dict) and x.get("url")]
+            else:
+                value = data.get("url") or data.get("redirect")
+                if value:
+                    urls = [value]
+            for media_url in urls:
+                try:
+                    rr = requests.get(media_url, stream=True, timeout=(15, 120), allow_redirects=True)
+                    rr.raise_for_status()
+                    ct = (rr.headers.get("Content-Type") or "").lower()
+                    ext = ".mp4" if "video" in ct else ".jpg" if "image" in ct else ".bin"
+                    out = folder / ("cobalt_media" + ext)
+                    with out.open("wb") as fh:
+                        for chunk in rr.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                fh.write(chunk)
+                    if out.exists() and out.stat().st_size > 0:
+                        return [out]
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return []
+
+
 def download_public_url(url: str) -> tuple[list[Path], Path]:
     """Try gallery-dl then yt-dlp for a public URL.
 
@@ -92,6 +143,10 @@ def download_public_url(url: str) -> tuple[list[Path], Path]:
     """
     DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     folder = Path(tempfile.mkdtemp(prefix="universal_", dir=DOWNLOAD_ROOT))
+
+    files = _run_cobalt(url, folder)
+    if files:
+        return files, folder
 
     files = _run_gallery_dl(url, folder)
     if not files:
