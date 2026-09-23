@@ -85,14 +85,16 @@ class MediaDownloader:
         except Exception as e:
             logger.warning("Cleanup failed: %s", e)
 
-    def _save_url(self, media_url: str, dest: Path) -> Optional[Path]:
+    def _save_url(self, media_url: str, dest: Path, filename_hint: str = "") -> Optional[Path]:
         try:
             r = self.session.get(media_url, stream=True, timeout=60)
             r.raise_for_status()
-            ctype = r.headers.get("content-type", "")
-            ext = ".mp4" if "video" in ctype else ".jpg" if "image" in ctype else ".bin"
-            name = f"{uuid.uuid4().hex[:10]}{ext}"
-            fpath = dest / name
+            ctype = (r.headers.get("content-type", "") or "").lower()
+            hint = (filename_hint or media_url).lower().split("?")[0]
+            ext = Path(hint).suffix.lower()
+            if ext not in {".mp4", ".mkv", ".webm", ".mov", ".avi", ".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+                ext = ".mp4" if "video/" in ctype else ".jpg" if "image/" in ctype else ".mp4"
+            fpath = dest / f"{uuid.uuid4().hex[:10]}{ext}"
             with open(fpath, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
@@ -106,53 +108,38 @@ class MediaDownloader:
         files = []
         payload = {
             "url": url,
-            "vCodec": "h264",
-            "vQuality": "1080",
-            "aFormat": "best",
-            "filenameStyle": "basic",
-            "isAudioOnly": False,
+            "videoQuality": "1080",
+            "audioFormat": "best",
             "downloadMode": "auto",
-            "isAudioMuted": False,
+            "filenameStyle": "basic",
             "disableMetadata": True,
+            "youtubeVideoCodec": "h264",
         }
-
         for endpoint in COBALT_ENDPOINTS:
             try:
-                r = self.session.post(
-                    endpoint.rstrip("/") + "/",
-                    json=payload,
-                    headers={"Accept": "application/json", "Content-Type": "application/json"},
-                    timeout=30,
-                )
+                r = self.session.post(endpoint.rstrip("/") + "/", json=payload,
+                    headers={"Accept": "application/json", "Content-Type": "application/json"}, timeout=30)
                 if r.status_code != 200:
-                    r = self.session.post(endpoint.rstrip("/") + "/api/json", json=payload, timeout=30)
-
+                    r = self.session.post(endpoint.rstrip("/") + "/api/json", json=payload,
+                        headers={"Accept": "application/json", "Content-Type": "application/json"}, timeout=30)
                 data = r.json()
                 status = data.get("status")
-
                 if status in ("error", "rate-limit"):
                     continue
-
-                if status in ("redirect", "tunnel", "success") or "url" in data:
-                    media_url = data.get("url") or data.get("redirect")
-                    if media_url:
-                        fpath = self._save_url(media_url, dest)
-                        if fpath:
-                            files.append(fpath)
-                            return files
-
-                if status == "picker" and "picker" in data:
+                if status in ("tunnel", "redirect") and data.get("url"):
+                    fpath = self._save_url(data["url"], dest, data.get("filename", ""))
+                    if fpath:
+                        return [fpath]
+                if status == "picker" and data.get("picker"):
                     for item in data["picker"]:
-                        media_url = item.get("url")
-                        if media_url:
-                            fpath = self._save_url(media_url, dest)
+                        if item.get("url"):
+                            fpath = self._save_url(item["url"], dest, item.get("filename", ""))
                             if fpath:
                                 files.append(fpath)
                     if files:
                         return files
             except Exception as e:
                 logger.debug("Cobalt failed: %s", e)
-                continue
         return files
 
     def _gallery_dl(self, url: str, dest: Path) -> List[Path]:
@@ -192,7 +179,7 @@ class MediaDownloader:
             "outtmpl": str(dest / "%(id)s.%(ext)s"),
             "quiet": True,
             "no_warnings": True,
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "format": "bv*+ba/b",
             "merge_output_format": "mp4",
             "noplaylist": True,
             "ignoreerrors": True,
