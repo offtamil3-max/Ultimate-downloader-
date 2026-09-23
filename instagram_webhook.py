@@ -7,6 +7,8 @@ from environment variables.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import mimetypes
 import os
@@ -42,6 +44,7 @@ ACCEPTED_VERIFY_TOKENS = {
 }
 TARGET_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN", "").strip()
+INSTAGRAM_APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET", "").strip()
 INSTAGRAM_SESSION_COOKIE = os.getenv("INSTAGRAM_SESSION_COOKIE", "").strip()
 INSTAGRAM_CSRF_TOKEN = os.getenv("INSTAGRAM_CSRF_TOKEN", "").strip()
 INSTAGRAM_WWW_CLAIM = os.getenv("INSTAGRAM_WWW_CLAIM", "").strip()
@@ -1206,13 +1209,81 @@ def _download_and_forward(
 
 
 def _handle_event(bot, event: dict[str, Any]) -> None:
-    """Acknowledge Instagram webhook events without forwarding media.
+    """Process one Instagram webhook entry through the private DM connector.
 
-    The Instagram API/webhook configuration remains available for resolver
-    functionality, but the automatic Instagram-DM -> Telegram forwarding
-    action is intentionally disabled.
+    The connector deliberately accepts only actual message events, ignores
+    echo/self events, de-duplicates message IDs, and hands media resolution
+    to the resolver chain above. It never exposes Instagram credentials.
     """
-    logger.info("Instagram DM forwarding disabled; webhook event ignored")
+    if not isinstance(event, dict):
+        return
+
+    for item in event.get("messaging") or []:
+        if not isinstance(item, dict):
+            continue
+
+        message = item.get("message") or {}
+        if not isinstance(message, dict):
+            continue
+
+        if message.get("is_echo"):
+            logger.info("Instagram connector ignored echo/self message")
+            continue
+
+        mid = str(message.get("mid") or "").strip()
+        if _already_seen(mid):
+            logger.info("Instagram connector ignored duplicate mid=%s", mid)
+            continue
+
+        attachments = message.get("attachments") or []
+        if not isinstance(attachments, list):
+            attachments = []
+
+        sender = item.get("sender") or {}
+        sender_id = str(sender.get("id") or "").strip() or None
+        caption = message.get("text")
+        caption = caption.strip() if isinstance(caption, str) and caption.strip() else None
+
+        if not attachments:
+            logger.info(
+                "Instagram connector ignored non-media message mid=%s sender=%s",
+                mid,
+                sender_id,
+            )
+            continue
+
+        logger.info(
+            "Instagram connector received media DM: mid=%s sender=%s attachments=%d",
+            mid,
+            sender_id,
+            len(attachments),
+        )
+
+        threading.Thread(
+            target=_download_and_forward,
+            args=(bot, attachments, caption, mid, sender_id),
+            daemon=True,
+        ).start()
+
+
+def _verify_meta_signature(raw_body: bytes) -> bool:
+    """Verify Meta's X-Hub-Signature-256 when an app secret is configured."""
+    if not INSTAGRAM_APP_SECRET:
+        logger.warning(
+            "INSTAGRAM_APP_SECRET is not configured; accepting webhook without signature verification"
+        )
+        return True
+
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    if not signature.startswith("sha256="):
+        return False
+
+    expected = hmac.new(
+        INSTAGRAM_APP_SECRET.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(signature[7:], expected)
 
 
 @app.get("/instagram/webhook")
@@ -1251,6 +1322,11 @@ def verify_webhook():
 
 @app.post("/instagram/webhook")
 def receive_webhook():
+    raw_body = request.get_data(cache=True)
+    if not _verify_meta_signature(raw_body):
+        logger.warning("Instagram connector rejected invalid Meta webhook signature")
+        return jsonify({"ok": False, "error": "invalid signature"}), 403
+
     payload = request.get_json(silent=True) or {}
     bot = app.config.get("telegram_bot")
 
@@ -1262,10 +1338,19 @@ def receive_webhook():
             503,
         )
 
-    for entry in payload.get("entry") or []:
+    entries = payload.get("entry") or []
+    logger.info(
+        "Instagram connector webhook received: object=%s entries=%d",
+        payload.get("object"),
+        len(entries) if isinstance(entries, list) else 0,
+    )
+
+    for entry in entries:
         if isinstance(entry, dict):
             _handle_event(bot, entry)
 
+    # Meta expects a fast 200 acknowledgement; actual resolution/upload runs
+    # asynchronously in a worker thread.
     return jsonify({"ok": True}), 200
 
 
@@ -1375,35 +1460,16 @@ def start_instagram_webhook(bot) -> None:
 
     app.config["telegram_bot"] = bot
 
-    # Telegram webhooks and getUpdates are mutually exclusive. Using the
-    # webhook removes the recurring 409 conflict when another instance is
-    # still polling the same bot token.
-    telegram_webhook_url = f"{PUBLIC_BASE_URL}/telegram/webhook"
-    try:
-        if TELEGRAM_WEBHOOK_SECRET:
-            bot.set_webhook(
-                url=telegram_webhook_url,
-                secret_token=TELEGRAM_WEBHOOK_SECRET,
-                drop_pending_updates=False,
-            )
-        else:
-            bot.set_webhook(
-                url=telegram_webhook_url,
-                drop_pending_updates=False,
-            )
-        logger.info("Telegram webhook configured: %s", telegram_webhook_url)
-        try:
-            info = bot.get_webhook_info()
-            logger.info(
-                "Telegram webhook info: url=%s pending=%s last_error=%s",
-                getattr(info, "url", ""),
-                getattr(info, "pending_update_count", None),
-                getattr(info, "last_error_message", None),
-            )
-        except Exception:
-            logger.exception("Could not read Telegram webhook info")
-    except Exception:
-        logger.exception("Failed to configure Telegram webhook")
+    # This module is an Instagram-only connector. Telegram remains on the
+    # downloader's normal polling path in main.py; we intentionally do not
+    # call set_webhook() here because Telegram polling and webhooks conflict.
+    if INSTAGRAM_APP_SECRET:
+        logger.info("Instagram connector Meta signature verification: enabled")
+    else:
+        logger.warning(
+            "Instagram connector Meta signature verification: disabled "
+            "(set INSTAGRAM_APP_SECRET for production hardening)"
+        )
 
     thread = threading.Thread(
         target=lambda: app.run(
