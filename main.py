@@ -18,6 +18,8 @@ import requests
 import yt_dlp
 import telebot
 from telebot import types
+
+from instagram_webhook import start_instagram_webhook
 from telebot.types import InputMediaPhoto, InputMediaVideo
 
 # ==================== CONFIG ====================
@@ -341,4 +343,14 @@ def channel_handler(message: types.Message):
 if __name__ == "__main__":
     logger.info("Starting Ultimate Downloader Bot...")
     Path(DOWNLOAD_ROOT).mkdir(exist_ok=True)
+
+    # Start the private Instagram DM connector beside the original Telegram
+    # downloader. It runs its own HTTPS webhook listener and does not change
+    # the downloader's link-paste flow.
+    try:
+        start_instagram_webhook(bot)
+        logger.info("Private Instagram DM connector started")
+    except Exception:
+        logger.exception("Private Instagram DM connector failed to start")
+
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
