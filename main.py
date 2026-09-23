@@ -108,9 +108,11 @@ class MediaDownloader:
             "url": url,
             "vCodec": "h264",
             "vQuality": "1080",
-            "aFormat": "mp3",
+            "aFormat": "best",
             "filenameStyle": "basic",
             "isAudioOnly": False,
+            "downloadMode": "auto",
+            "isAudioMuted": False,
             "disableMetadata": True,
         }
 
@@ -131,7 +133,7 @@ class MediaDownloader:
                 if status in ("error", "rate-limit"):
                     continue
 
-                if status == "redirect" or "url" in data:
+                if status in ("redirect", "tunnel", "success") or "url" in data:
                     media_url = data.get("url") or data.get("redirect")
                     if media_url:
                         fpath = self._save_url(media_url, dest)
