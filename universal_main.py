@@ -109,7 +109,6 @@ def universal_channel_handler(message: types.Message):
 
 
 if __name__ == "__main__":
-    logger.info("Starting Ultimate Downloader Bot with universal fallback...")
+    logger.info("Starting Ultimate Downloader Bot with universal webhook...")
     Path(existing.DOWNLOAD_ROOT).mkdir(exist_ok=True)
     start_instagram_webhook(bot)
-    bot.infinity_polling(timeout=60, long_polling_timeout=60)
