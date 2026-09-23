@@ -298,7 +298,18 @@ def _instagram_direct_shared_post_urls(
     extracts that target URL before falling back to media-id resolvers.
     """
     global _instagr_api_client
+    logger.info(
+        "Instagram Direct resolver start: sender_id_present=%s webhook_mid_present=%s instagrapi_available=%s",
+        bool(sender_id),
+        bool(webhook_mid),
+        InstaGrapiClient is not None,
+    )
     if InstaGrapiClient is None or not sender_id:
+        logger.warning(
+            "Instagram Direct resolver skipped: sender_id=%r instagrapi_available=%s",
+            sender_id,
+            InstaGrapiClient is not None,
+        )
         return []
 
     cookie_header = _instagram_cookie_header()
@@ -366,6 +377,7 @@ def _instagram_direct_shared_post_urls(
         def message_urls(dm: Any) -> list[str]:
             found: list[str] = []
             for attr in (
+                "link",
                 "xma_share",
                 "media_share",
                 "reel_share",
@@ -407,18 +419,35 @@ def _instagram_direct_shared_post_urls(
             try:
                 messages = list(
                     getattr(thread, "messages", None)
-                    or client.direct_messages(thread.id, amount=15)
+                    or client.direct_messages(thread.id, amount=30)
                     or []
                 )
             except Exception:
+                logger.info(
+                    "Instagram Direct message fetch failed thread=%s",
+                    getattr(thread, "id", None),
+                    exc_info=True,
+                )
                 continue
 
+            logger.info(
+                "Instagram Direct thread fetched: thread=%s messages=%d",
+                getattr(thread, "id", None),
+                len(messages),
+            )
             exact = []
             recent_sender = []
             for dm in messages:
                 dm_id = str(getattr(dm, "id", "") or "")
                 dm_user_id = str(getattr(dm, "user_id", "") or "")
                 urls = message_urls(dm)
+                if urls:
+                    logger.info(
+                        "Instagram Direct share candidate: dm_id=%s item_type=%s urls=%d",
+                        dm_id,
+                        getattr(dm, "item_type", None),
+                        len(urls),
+                    )
                 if not urls:
                     continue
                 if webhook_mid and dm_id == str(webhook_mid):
@@ -439,7 +468,7 @@ def _instagram_direct_shared_post_urls(
                 )
                 return urls
 
-        logger.info(
+        logger.warning(
             "Instagram Direct resolver found no canonical share URL: sender_id=%s webhook_mid=%s",
             sender_id,
             webhook_mid,
@@ -1211,6 +1240,17 @@ def _handle_event(bot, event: dict[str, Any]) -> None:
             attachments.append({"payload": {"link": recovered_link}})
 
         if attachments:
+            sender_id = (
+                (item.get("sender") or {}).get("id")
+                if isinstance(item.get("sender"), dict)
+                else None
+            )
+            logger.info(
+                "Instagram DM event accepted: mid=%s sender_id=%s attachments=%d",
+                mid,
+                sender_id,
+                len(attachments),
+            )
             threading.Thread(
                 target=_download_and_forward,
                 args=(
@@ -1218,9 +1258,7 @@ def _handle_event(bot, event: dict[str, Any]) -> None:
                     attachments,
                     None,
                     mid,
-                    (item.get("sender") or {}).get("id")
-                    if isinstance(item.get("sender"), dict)
-                    else None,
+                    sender_id,
                 ),
                 daemon=True,
             ).start()
