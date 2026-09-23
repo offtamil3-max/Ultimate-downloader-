@@ -1,1 +1,1 @@
-worker: python universal_main.py
+worker: python main.py
