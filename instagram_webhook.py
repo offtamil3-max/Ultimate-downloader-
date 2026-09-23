@@ -626,9 +626,38 @@ def _download_and_forward(
             if isinstance(media_id, str) and media_id not in seen_ids:
                 seen_ids.add(media_id)
                 logger.info(
-                    "Instagram share media_id=%s; skipping media /children lookup",
+                    "Instagram share media_id=%s; Graph children lookup disabled",
                     media_id,
                 )
+
+                # If Meta does not expose the original permalink and the
+                # mobile media-info endpoint rejects the request, derive the
+                # public Instagram shortcode from the media ID and let
+                # gallery-dl/yt-dlp resolve the public post. This is the key
+                # fallback for shared public carousels.
+                shortcode = _media_id_to_shortcode(media_id)
+                if shortcode:
+                    derived_link = f"https://www.instagram.com/p/{shortcode}/"
+                    try:
+                        logger.info(
+                            "Instagram trying derived public permalink: %s",
+                            derived_link,
+                        )
+                        derived_files, derived_dir = download_public_url(derived_link)
+                        if derived_files:
+                            if derived_dir:
+                                temp_dirs.append(derived_dir)
+                            all_files.extend(derived_files)
+                            logger.info(
+                                "Instagram derived permalink downloaded %d file(s)",
+                                len(derived_files),
+                            )
+                            continue
+                        if derived_dir:
+                            shutil.rmtree(derived_dir, ignore_errors=True)
+                        logger.info("Instagram derived permalink returned no files")
+                    except Exception:
+                        logger.exception("Instagram derived permalink fallback failed")
 
             if isinstance(post_link, str) and "instagram.com" in post_link:
                 try:
