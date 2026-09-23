@@ -215,6 +215,86 @@ def _instagram_token_ok() -> bool:
     return False
 
 
+def _instagram_mobile_media_urls(media_id: str) -> list[str]:
+    """Resolve shared media through Instagram's mobile media-info endpoint.
+
+    This is intentionally separate from the Graph API /children edge. The
+    Messaging webhook gives us the original numeric media ID, and Instagram's
+    own media-info endpoint can return carousel_media for that ID.
+    """
+    if not media_id or not media_id.isdigit():
+        return []
+
+    try:
+        response = requests.get(
+            f"https://i.instagram.com/api/v1/media/{media_id}/info/",
+            headers={
+                "X-IG-App-ID": "936619743392459",
+                "User-Agent": (
+                    "Instagram 390.0.0.0.74 Android "
+                    "(30/11; 420dpi; 1080x2400; samsung; SM-G991B; "
+                    "o1s; exynos2100; en_US; 300000000)"
+                ),
+                "Accept": "*/*",
+            },
+            timeout=(15, 30),
+        )
+        if not response.ok:
+            logger.info(
+                "Instagram mobile media-info lookup failed: HTTP %s",
+                response.status_code,
+            )
+            return []
+
+        data = response.json()
+        items = data.get("items") or []
+        if not items or not isinstance(items[0], dict):
+            return []
+
+        item = items[0]
+        media_items = item.get("carousel_media")
+        if not isinstance(media_items, list):
+            media_items = [item]
+
+        urls: list[str] = []
+
+        for media in media_items:
+            if not isinstance(media, dict):
+                continue
+
+            videos = media.get("video_versions") or []
+            if isinstance(videos, list):
+                for candidate in videos:
+                    if isinstance(candidate, dict):
+                        url = candidate.get("url")
+                        if isinstance(url, str) and url.startswith(("http://", "https://")):
+                            urls.append(url)
+                            break
+
+            if urls and urls[-1].startswith(("http://", "https://")) and media.get("video_versions"):
+                continue
+
+            images = media.get("image_versions2", {}).get("candidates", [])
+            if isinstance(images, list):
+                for candidate in images:
+                    if isinstance(candidate, dict):
+                        url = candidate.get("url")
+                        if isinstance(url, str) and url.startswith(("http://", "https://")):
+                            urls.append(url)
+                            break
+
+        urls = list(dict.fromkeys(urls))
+        logger.info(
+            "Instagram mobile media-info resolved %d media URL(s), carousel=%s",
+            len(urls),
+            len(media_items) > 1,
+        )
+        return urls
+    except Exception:
+        logger.exception("Instagram mobile media-info lookup errored")
+        return []
+
+
 def _graph_attachment_edge(message_id: str) -> tuple[list[dict[str, Any]], list[str]]:
     """Try the message attachments edge instead of the media /children edge."""
     if not INSTAGRAM_ACCESS_TOKEN or not message_id:
@@ -459,6 +539,20 @@ def _download_and_forward(
             # permalink is the supported public fallback and gallery-dl can
             # expand the carousel.
             post_link = payload.get("link") or payload.get("permalink_url")
+            # First alternative: Instagram's own mobile media-info API.
+            # It can return the complete carousel_media array from the shared
+            # numeric media ID without using Graph /children.
+            if isinstance(media_id, str):
+                mobile_urls = _instagram_mobile_media_urls(media_id)
+                if mobile_urls:
+                    urls.extend(mobile_urls)
+                    direct_urls.update(mobile_urls)
+                    logger.info(
+                        "Instagram share resolved through mobile media-info: %d item(s)",
+                        len(mobile_urls),
+                    )
+                    continue
+
 
             logger.info(
                 "Instagram attachment: type=%s media_id_present=%s post_link_present=%s",
