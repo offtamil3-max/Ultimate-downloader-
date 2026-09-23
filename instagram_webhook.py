@@ -48,6 +48,9 @@ INSTAGRAM_APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET", "").strip()
 INSTAGRAM_SESSION_COOKIE = os.getenv("INSTAGRAM_SESSION_COOKIE", "").strip()
 INSTAGRAM_CSRF_TOKEN = os.getenv("INSTAGRAM_CSRF_TOKEN", "").strip()
 INSTAGRAM_WWW_CLAIM = os.getenv("INSTAGRAM_WWW_CLAIM", "").strip()
+INSTAGRAM_BROWSER_RESOLVER = os.getenv("INSTAGRAM_BROWSER_RESOLVER", "false").strip().lower() in {"1", "true", "yes", "on"}
+PLAYWRIGHT_EXECUTABLE_PATH = os.getenv("PLAYWRIGHT_EXECUTABLE_PATH", "").strip()
+INSTAGRAM_BROWSER_WAIT_SECONDS = float(os.getenv("INSTAGRAM_BROWSER_WAIT_SECONDS", "6"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip() or ("cookies.txt" if Path("cookies.txt").exists() else "")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://ultimate-downloader-production.up.railway.app").strip().rstrip("/")
@@ -976,6 +979,169 @@ def _media_id_to_shortcode(media_id: str) -> str | None:
     return "".join(reversed(chars))
 
 
+def _instagram_browser_shared_post_urls(
+    sender_id: str | None = None,
+    webhook_mid: str | None = None,
+) -> list[str]:
+    """Use a real Instagram web session to inspect Direct-message network data.
+
+    This is an optional resolver. It opens Instagram's Direct inbox with the
+    existing session cookie, captures JSON responses used by the web client,
+    recursively separates Instagram post/reel URLs from the message payload,
+    and returns only canonical media links. No credentials are hard-coded.
+    """
+    if not INSTAGRAM_BROWSER_RESOLVER:
+        return []
+
+    cookie_header = _instagram_cookie_header()
+    if not cookie_header:
+        logger.info("Instagram browser resolver skipped: no session cookie")
+        return []
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.warning("Instagram browser resolver skipped: Playwright is not installed")
+        return []
+
+    def cookie_pairs(header: str) -> list[dict[str, Any]]:
+        result = []
+        for part in header.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name, value = name.strip(), value.strip()
+            if not name:
+                continue
+            result.append({
+                "name": name,
+                "value": value,
+                "domain": ".instagram.com",
+                "path": "/",
+            })
+        return result
+
+    def collect_urls(value: Any, out: list[str]) -> None:
+        if isinstance(value, str):
+            value = value.strip()
+            if (
+                value.startswith(("http://", "https://"))
+                and "instagram.com/" in value
+                and re.search(r"/(?:p|reel|tv)/[A-Za-z0-9_-]+", value)
+            ):
+                out.append(value.split("?", 1)[0])
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                # Shared-post objects commonly use link/url/web_uri fields,
+                # but recursively scanning the whole JSON keeps this tolerant
+                # of Instagram's changing response shapes.
+                if key in {"link", "url", "web_uri", "target_url", "permalink", "permalink_url"}:
+                    collect_urls(item, out)
+                elif isinstance(item, (dict, list)):
+                    collect_urls(item, out)
+            return
+        if isinstance(value, list):
+            for item in value:
+                collect_urls(item, out)
+
+    captured: list[tuple[str, Any]] = []
+
+    try:
+        with sync_playwright() as pw:
+            launch_kwargs: dict[str, Any] = {
+                "headless": True,
+                "args": [
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ],
+            }
+            if PLAYWRIGHT_EXECUTABLE_PATH:
+                launch_kwargs["executable_path"] = PLAYWRIGHT_EXECUTABLE_PATH
+
+            browser = pw.chromium.launch(**launch_kwargs)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Linux; Android 13; K) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0 Mobile Safari/537.36"
+                ),
+                viewport={"width": 412, "height": 915},
+            )
+            context.add_cookies(cookie_pairs(cookie_header))
+            page = context.new_page()
+
+            def on_response(response: Any) -> None:
+                try:
+                    url = response.url
+                    if "/direct_v2/" not in url and "/api/v1/direct" not in url:
+                        return
+                    ctype = (response.headers.get("content-type") or "").lower()
+                    if "json" not in ctype:
+                        return
+                    # response.json() is intentionally avoided here because
+                    # Playwright versions differ; body+json.loads is stable.
+                    import json as _json
+                    data = _json.loads(response.body().decode("utf-8", "replace"))
+                    captured.append((url, data))
+                except Exception:
+                    pass
+
+            page.on("response", on_response)
+
+            page.goto(
+                "https://www.instagram.com/direct/inbox/",
+                wait_until="domcontentloaded",
+                timeout=45000,
+            )
+            page.wait_for_timeout(max(1000, int(INSTAGRAM_BROWSER_WAIT_SECONDS * 1000)))
+
+            # Also inspect the rendered DOM. Some shared-post links are added
+            # client-side without appearing in the initial API response.
+            try:
+                hrefs = page.locator('a[href*="/p/"], a[href*="/reel/"], a[href*="/tv/"]').evaluate_all(
+                    "(els) => els.map(e => e.href)"
+                )
+                captured.append(("dom", hrefs))
+            except Exception:
+                pass
+
+            browser.close()
+
+        urls: list[str] = []
+        for _, data in captured:
+            collect_urls(data, urls)
+
+        urls = list(dict.fromkeys(urls))
+
+        # If the exact webhook message ID appears in captured JSON, prefer
+        # links from that message. This prevents an unrelated recent DM from
+        # being selected when the inbox contains many shared posts.
+        if webhook_mid:
+            exact_urls: list[str] = []
+            for url, data in captured:
+                text = str(data)
+                if str(webhook_mid) in text:
+                    collect_urls(data, exact_urls)
+            exact_urls = list(dict.fromkeys(exact_urls))
+            if exact_urls:
+                urls = exact_urls
+
+        logger.info(
+            "Instagram browser resolver captured=%d response payload(s), recovered=%d canonical URL(s), sender_id_present=%s exact_mid=%s",
+            len(captured),
+            len(urls),
+            bool(sender_id),
+            bool(webhook_mid and any(str(webhook_mid) in str(data) for _, data in captured)),
+        )
+        return urls
+    except Exception:
+        logger.exception("Instagram browser shared-post resolver failed")
+        return []
+
+
 def _download_and_forward(
     bot,
     attachments: list[dict[str, Any]],
@@ -1023,6 +1189,42 @@ def _download_and_forward(
                         logger.exception(
                             "Instagram DM original-link download failed: %s",
                             url,
+                        )
+                if all_files:
+                    _send_to_telegram(bot, all_files, caption=caption)
+                    return
+
+        # Optional browser-session resolver. It is deliberately a
+        # separate feature switch so the normal downloader/resolver chain is
+        # unchanged when INSTAGRAM_BROWSER_RESOLVER=false.
+        if sender_id and INSTAGRAM_BROWSER_RESOLVER:
+            browser_urls = _instagram_browser_shared_post_urls(
+                sender_id=sender_id,
+                webhook_mid=message_id,
+            )
+            if browser_urls:
+                logger.info(
+                    "Instagram browser resolver recovered %d canonical URL(s)",
+                    len(browser_urls),
+                )
+                for browser_url in browser_urls:
+                    try:
+                        resolved_files, resolved_dir = download_public_url(browser_url)
+                        if resolved_files:
+                            if resolved_dir:
+                                temp_dirs.append(resolved_dir)
+                            all_files.extend(resolved_files)
+                            logger.info(
+                                "Instagram browser canonical URL download succeeded: %d file(s)",
+                                len(resolved_files),
+                            )
+                            break
+                        if resolved_dir:
+                            shutil.rmtree(resolved_dir, ignore_errors=True)
+                    except Exception:
+                        logger.exception(
+                            "Instagram browser canonical URL download failed: %s",
+                            browser_url,
                         )
                 if all_files:
                     _send_to_telegram(bot, all_files, caption=caption)
@@ -1521,6 +1723,15 @@ def start_instagram_webhook(bot) -> None:
         logger.warning(
             "TELEGRAM_CHANNEL_ID is not configured; Instagram media "
             "cannot be forwarded."
+        )
+
+    if INSTAGRAM_BROWSER_RESOLVER:
+        logger.info(
+            "Instagram browser resolver: enabled; Playwright will inspect Direct web-session data"
+        )
+    else:
+        logger.info(
+            "Instagram browser resolver: disabled (set INSTAGRAM_BROWSER_RESOLVER=true to enable)"
         )
 
     if not INSTAGRAM_ACCESS_TOKEN:
