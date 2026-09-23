@@ -284,6 +284,171 @@ def _instagram_mobile_headers(host: str) -> dict[str, str]:
     return headers
 
 
+
+def _instagram_direct_shared_post_urls(
+    sender_id: str | None,
+    webhook_mid: str | None = None,
+) -> list[str]:
+    """Recover the canonical Instagram URL from the actual DM message.
+
+    The Messaging webhook can expose only a signed preview/CDN URL for an
+    ig_post share. Instagram's authenticated Direct API can contain the
+    richer XMA/share object, including its original target URL. This resolver
+    reads the bot account's own inbox using the existing session cookie and
+    extracts that target URL before falling back to media-id resolvers.
+    """
+    global _instagr_api_client
+    if InstaGrapiClient is None or not sender_id:
+        return []
+
+    cookie_header = _instagram_cookie_header()
+    if not cookie_header:
+        logger.info("Instagram Direct resolver skipped: no session cookie")
+        return []
+
+    try:
+        cookies: dict[str, str] = {}
+        for part in cookie_header.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            cookies[name.strip()] = value.strip()
+
+        sessionid = cookies.get("sessionid")
+        if not sessionid:
+            logger.warning("Instagram Direct resolver skipped: sessionid cookie missing")
+            return []
+
+        with _instagr_api_lock:
+            if _instagr_api_client is None:
+                client = InstaGrapiClient()
+                client.set_user_agent(
+                    "Instagram 390.0.0.0.74 Android (30/11; 420dpi; 1080x2400; samsung; SM-G991B; o1s; exynos2100; en_US)"
+                )
+                client.login_by_sessionid(sessionid)
+                _instagr_api_client = client
+            client = _instagr_api_client
+
+        def public_instagram_url(value: Any) -> str | None:
+            if not isinstance(value, str):
+                return None
+            value = value.strip()
+            if value.startswith(("http://", "https://")) and "instagram.com/" in value:
+                return value.split("?", 1)[0]
+            return None
+
+        def collect(obj: Any, out: list[str]) -> None:
+            if obj is None:
+                return
+            if isinstance(obj, str):
+                url = public_instagram_url(obj)
+                if url:
+                    out.append(url)
+                return
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    key_l = str(key).lower()
+                    if key_l in {
+                        "target_url", "url", "link", "permalink",
+                        "permalink_url", "web_uri", "weburl",
+                    }:
+                        url = public_instagram_url(value)
+                        if url:
+                            out.append(url)
+                    if isinstance(value, (dict, list)):
+                        collect(value, out)
+                return
+            if isinstance(obj, (list, tuple)):
+                for value in obj:
+                    collect(value, out)
+
+        def message_urls(dm: Any) -> list[str]:
+            found: list[str] = []
+            for attr in (
+                "xma_share",
+                "media_share",
+                "reel_share",
+                "story_share",
+                "felix_share",
+                "clip",
+                "generic_xma",
+                "raw_xma",
+            ):
+                try:
+                    collect(getattr(dm, attr, None), found)
+                except Exception:
+                    pass
+            return list(dict.fromkeys(found))
+
+        threads: list[Any] = []
+        try:
+            participant_id = int(str(sender_id))
+            thread = client.direct_thread_by_participants([participant_id])
+            if thread:
+                threads.append(thread)
+        except Exception:
+            logger.info(
+                "Instagram Direct participant lookup failed sender_id=%s",
+                sender_id,
+                exc_info=True,
+            )
+
+        if not threads:
+            try:
+                threads.extend(
+                    client.direct_threads(amount=30, thread_message_limit=15)
+                    or []
+                )
+            except Exception:
+                logger.info("Instagram Direct inbox scan failed", exc_info=True)
+
+        for thread in threads:
+            try:
+                messages = list(
+                    getattr(thread, "messages", None)
+                    or client.direct_messages(thread.id, amount=15)
+                    or []
+                )
+            except Exception:
+                continue
+
+            exact = []
+            recent_sender = []
+            for dm in messages:
+                dm_id = str(getattr(dm, "id", "") or "")
+                dm_user_id = str(getattr(dm, "user_id", "") or "")
+                urls = message_urls(dm)
+                if not urls:
+                    continue
+                if webhook_mid and dm_id == str(webhook_mid):
+                    exact.append((dm, urls))
+                if sender_id and dm_user_id == str(sender_id):
+                    recent_sender.append((dm, urls))
+
+            candidates = exact or recent_sender
+            if candidates:
+                dm, urls = candidates[-1]
+                logger.info(
+                    "Instagram Direct resolver recovered %d original URL(s): "
+                    "thread=%s exact_mid=%s item_type=%s",
+                    len(urls),
+                    getattr(thread, "id", None),
+                    bool(exact),
+                    getattr(dm, "item_type", None),
+                )
+                return urls
+
+        logger.info(
+            "Instagram Direct resolver found no canonical share URL: sender_id=%s webhook_mid=%s",
+            sender_id,
+            webhook_mid,
+        )
+    except Exception:
+        logger.exception("Instagram Direct shared-post resolver failed")
+    return []
+
+
 def _instagram_private_api_media_urls(media_id: str) -> list[str]:
     """Resolve a shared media ID through Instagram's private/mobile API.
 
@@ -757,7 +922,11 @@ def _media_id_to_shortcode(media_id: str) -> str | None:
 
 
 def _download_and_forward(
-    bot, attachments: list[dict[str, Any]], caption: str | None = None
+    bot,
+    attachments: list[dict[str, Any]],
+    caption: str | None = None,
+    message_id: str | None = None,
+    sender_id: str | None = None,
 ) -> None:
     temp_dirs: list[str] = []
     all_files: list[Path] = []
@@ -766,6 +935,42 @@ def _download_and_forward(
         urls: list[str] = []
         direct_urls: set[str] = set()
         seen_ids: set[str] = set()
+
+        # First recover the canonical URL from the actual Instagram DM.
+        # Once found, the existing downloader can expand the complete
+        # carousel exactly like a normal Instagram URL sent to Telegram.
+        if sender_id:
+            direct_share_urls = _instagram_direct_shared_post_urls(
+                sender_id=sender_id,
+                webhook_mid=message_id,
+            )
+            if direct_share_urls:
+                logger.info(
+                    "Instagram DM original-link resolver succeeded: %d URL(s)",
+                    len(direct_share_urls),
+                )
+                for url in direct_share_urls:
+                    try:
+                        resolved_files, resolved_dir = download_public_url(url)
+                        if resolved_files:
+                            if resolved_dir:
+                                temp_dirs.append(resolved_dir)
+                            all_files.extend(resolved_files)
+                            logger.info(
+                                "Instagram DM original-link download succeeded: %d file(s)",
+                                len(resolved_files),
+                            )
+                            break
+                        if resolved_dir:
+                            shutil.rmtree(resolved_dir, ignore_errors=True)
+                    except Exception:
+                        logger.exception(
+                            "Instagram DM original-link download failed: %s",
+                            url,
+                        )
+                if all_files:
+                    _send_to_telegram(bot, all_files, caption=caption)
+                    return
 
         for attachment in attachments:
             if not isinstance(attachment, dict):
@@ -1008,7 +1213,15 @@ def _handle_event(bot, event: dict[str, Any]) -> None:
         if attachments:
             threading.Thread(
                 target=_download_and_forward,
-                args=(bot, attachments, None),
+                args=(
+                    bot,
+                    attachments,
+                    None,
+                    mid,
+                    (item.get("sender") or {}).get("id")
+                    if isinstance(item.get("sender"), dict)
+                    else None,
+                ),
                 daemon=True,
             ).start()
             continue
@@ -1026,7 +1239,7 @@ def _handle_event(bot, event: dict[str, Any]) -> None:
                 ]
                 threading.Thread(
                     target=_download_and_forward,
-                    args=(bot, text_attachments, None),
+                    args=(bot, text_attachments, None, mid, None),
                     daemon=True,
                 ).start()
 
