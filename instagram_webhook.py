@@ -18,6 +18,12 @@ from typing import Any
 
 import requests
 from flask import Flask, jsonify, request
+
+try:
+    from instaloader import Instaloader, Post
+except ImportError:
+    Instaloader = None
+    Post = None
 from telebot import types as tg_types
 
 from universal_downloader import download_public_url
@@ -268,6 +274,80 @@ def _instagram_mobile_headers(host: str) -> dict[str, str]:
     if host == "www.instagram.com":
         headers["X-Requested-With"] = "XMLHttpRequest"
     return headers
+
+
+def _instagram_instaloader_media_urls(media_id: str) -> list[str]:
+    """Resolve a shared Instagram media ID using an authenticated web session.
+
+    This is the primary non-Graph resolver for shared posts. Instaloader's
+    current Post.from_mediaid() converts the numeric ID to the canonical
+    shortcode and fetches current post metadata, including all sidecar
+    children. The existing Instagram cookie is reused; no password is stored.
+    """
+    if Post is None or Instaloader is None or not media_id or not media_id.isdigit():
+        return []
+
+    cookie_header = _instagram_cookie_header()
+    if not cookie_header:
+        logger.info("Instagram Instaloader resolver skipped: no session cookie")
+        return []
+
+    try:
+        cookie_data: dict[str, str] = {}
+        for part in cookie_header.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            cookie_data[name.strip()] = value.strip()
+        cookie_data.setdefault("csrftoken", "")
+
+        username = os.getenv("INSTAGRAM_USERNAME", "vikatanathan").strip() or "vikatanathan"
+        loader = Instaloader(
+            sleep=False,
+            quiet=True,
+            request_timeout=45,
+            iphone_support=True,
+        )
+        loader.context.load_session(username, cookie_data)
+
+        post = Post.from_mediaid(loader.context, int(media_id))
+        urls: list[str] = []
+
+        if post.typename == "GraphSidecar":
+            for node in post.get_sidecar_nodes():
+                candidate = node.video_url if node.is_video else node.display_url
+                if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
+                    urls.append(candidate)
+        elif post.is_video:
+            candidate = post.video_url
+            if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
+                urls.append(candidate)
+        else:
+            candidate = post.url
+            if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
+                urls.append(candidate)
+
+        urls = list(dict.fromkeys(urls))
+        if urls:
+            logger.info(
+                "Instagram Instaloader resolver succeeded: media_id=%s shortcode=%s type=%s items=%d",
+                media_id,
+                post.shortcode,
+                post.typename,
+                len(urls),
+            )
+        else:
+            logger.warning(
+                "Instagram Instaloader resolver returned no media: media_id=%s shortcode=%s type=%s",
+                media_id,
+                post.shortcode,
+                post.typename,
+            )
+        return urls
+    except Exception:
+        logger.exception("Instagram Instaloader resolver failed for media_id=%s", media_id)
+        return []
 
 
 def _instagram_mobile_media_urls(media_id: str) -> list[str]:
@@ -601,9 +681,22 @@ def _download_and_forward(
             # permalink is the supported public fallback and gallery-dl can
             # expand the carousel.
             post_link = payload.get("link") or payload.get("permalink_url")
-            # First alternative: Instagram's own mobile media-info API.
-            # It can return the complete carousel_media array from the shared
-            # numeric media ID without using Graph /children.
+            # Primary resolver: authenticated Instagram session + Instaloader.
+            # This is intentionally tried before the Meta Graph/mobile fallbacks:
+            # a shared carousel can be visible to the logged-in Instagram account
+            # even when the webhook exposes only one signed CDN attachment.
+            if isinstance(media_id, str):
+                instaloader_urls = _instagram_instaloader_media_urls(media_id)
+                if instaloader_urls:
+                    urls.extend(instaloader_urls)
+                    direct_urls.update(instaloader_urls)
+                    logger.info(
+                        "Instagram share resolved through Instaloader: %d item(s)",
+                        len(instaloader_urls),
+                    )
+                    continue
+
+            # Secondary resolver: Instagram's own mobile media-info API.
             if isinstance(media_id, str):
                 mobile_urls = _instagram_mobile_media_urls(media_id)
                 if mobile_urls:
