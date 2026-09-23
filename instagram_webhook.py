@@ -24,6 +24,11 @@ try:
 except ImportError:
     Instaloader = None
     Post = None
+
+try:
+    from instagrapi import Client as InstaGrapiClient
+except ImportError:
+    InstaGrapiClient = None
 from telebot import types as tg_types
 
 from universal_downloader import download_public_url
@@ -49,6 +54,9 @@ PORT = int(os.getenv("PORT", "8080"))
 app = Flask(__name__)
 _seen_mids: set[str] = set()
 _seen_lock = threading.Lock()
+
+_instagr_api_client = None
+_instagr_api_lock = threading.Lock()
 
 
 def _already_seen(mid: str | None) -> bool:
@@ -274,6 +282,105 @@ def _instagram_mobile_headers(host: str) -> dict[str, str]:
     if host == "www.instagram.com":
         headers["X-Requested-With"] = "XMLHttpRequest"
     return headers
+
+
+def _instagram_private_api_media_urls(media_id: str) -> list[str]:
+    """Resolve a shared media ID through Instagram's private/mobile API.
+
+    Uses only the existing Instagram session cookie from Railway. This path
+    is intentionally separate from Instaloader because Instagram has recently
+    rotated/broken several web GraphQL endpoints; instagrapi exposes the
+    private media_info_v1/media_info_v2 fallbacks and understands albums.
+    """
+    global _instagr_api_client
+    if InstaGrapiClient is None or not media_id or not media_id.isdigit():
+        return []
+
+    cookie_header = _instagram_cookie_header()
+    if not cookie_header:
+        logger.info("Instagram private API resolver skipped: no session cookie")
+        return []
+
+    try:
+        cookies: dict[str, str] = {}
+        for part in cookie_header.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            cookies[name.strip()] = value.strip()
+
+        sessionid = cookies.get("sessionid")
+        if not sessionid:
+            logger.warning("Instagram private API resolver skipped: sessionid cookie missing")
+            return []
+
+        with _instagr_api_lock:
+            if _instagr_api_client is None:
+                client = InstaGrapiClient()
+                client.set_user_agent(
+                    "Instagram 390.0.0.0.74 Android (30/11; 420dpi; 1080x2400; samsung; SM-G991B; o1s; exynos2100; en_US)"
+                )
+                client.login_by_sessionid(sessionid)
+                _instagr_api_client = client
+            client = _instagr_api_client
+
+        media = None
+        # v1 is the normal private media endpoint; v2 is a useful fallback
+        # for media that the v1 endpoint rejects.
+        for resolver_name in ("media_info_v1", "media_info_v2"):
+            resolver = getattr(client, resolver_name, None)
+            if not callable(resolver):
+                continue
+            try:
+                media = resolver(media_id)
+                if media is not None:
+                    logger.info("Instagram private API %s succeeded for media_id=%s", resolver_name, media_id)
+                    break
+            except Exception:
+                logger.info("Instagram private API %s failed for media_id=%s", resolver_name, media_id, exc_info=True)
+
+        if media is None:
+            return []
+
+        urls: list[str] = []
+        resources = getattr(media, "resources", None) or []
+        for resource in resources:
+            media_type = getattr(resource, "media_type", None)
+            candidate = getattr(resource, "video_url", None) if media_type == 2 else getattr(resource, "thumbnail_url", None)
+            if candidate:
+                value = str(candidate)
+                if value.startswith(("http://", "https://")):
+                    urls.append(value)
+
+        if not urls:
+            video = getattr(media, "video_url", None)
+            if video:
+                urls.append(str(video))
+
+        if not urls:
+            image_versions = getattr(media, "image_versions2", None)
+            candidates = getattr(image_versions, "candidates", None) if image_versions else None
+            if candidates:
+                best = max(
+                    candidates,
+                    key=lambda x: (getattr(x, "width", 0) or 0) * (getattr(x, "height", 0) or 0),
+                )
+                value = getattr(best, "url", None)
+                if value:
+                    urls.append(str(value))
+
+        urls = list(dict.fromkeys(u for u in urls if u.startswith(("http://", "https://"))))
+        if urls:
+            logger.info(
+                "Instagram private API resolved %d media URL(s), media_type=%s",
+                len(urls),
+                getattr(media, "media_type", None),
+            )
+        return urls
+    except Exception:
+        logger.exception("Instagram private API resolver failed for media_id=%s", media_id)
+        return []
 
 
 def _instagram_instaloader_media_urls(media_id: str) -> list[str]:
@@ -681,10 +788,20 @@ def _download_and_forward(
             # permalink is the supported public fallback and gallery-dl can
             # expand the carousel.
             post_link = payload.get("link") or payload.get("permalink_url")
-            # Primary resolver: authenticated Instagram session + Instaloader.
-            # This is intentionally tried before the Meta Graph/mobile fallbacks:
-            # a shared carousel can be visible to the logged-in Instagram account
-            # even when the webhook exposes only one signed CDN attachment.
+            # Primary resolver: authenticated Instagram private/mobile API.
+            # It can expose all resources of a carousel from the media PK.
+            if isinstance(media_id, str):
+                private_urls = _instagram_private_api_media_urls(media_id)
+                if private_urls:
+                    urls.extend(private_urls)
+                    direct_urls.update(private_urls)
+                    logger.info(
+                        "Instagram share resolved through private API: %d item(s)",
+                        len(private_urls),
+                    )
+                    continue
+
+            # Secondary resolver: authenticated Instagram web session + Instaloader.
             if isinstance(media_id, str):
                 instaloader_urls = _instagram_instaloader_media_urls(media_id)
                 if instaloader_urls:
@@ -696,7 +813,7 @@ def _download_and_forward(
                     )
                     continue
 
-            # Secondary resolver: Instagram's own mobile media-info API.
+            # Tertiary resolver: Instagram's own mobile media-info API.
             if isinstance(media_id, str):
                 mobile_urls = _instagram_mobile_media_urls(media_id)
                 if mobile_urls:
