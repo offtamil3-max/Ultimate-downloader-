@@ -859,9 +859,25 @@ def receive_telegram_webhook():
             return jsonify({"ok": False, "error": "Forbidden"}), 403
 
     try:
-        update = tg_types.Update.de_json(request.data.decode("utf-8"))
-        if update is not None:
-            bot.process_new_updates([update])
+        raw = request.data.decode("utf-8")
+        logger.info(
+            "Telegram webhook received: bytes=%d update_id=%s",
+            len(raw),
+            (request.get_json(silent=True) or {}).get("update_id"),
+        )
+        update = tg_types.Update.de_json(raw)
+        if update is None:
+            logger.warning("Telegram webhook received an empty/unparseable update")
+            return jsonify({"ok": False, "error": "invalid update"}), 400
+
+        logger.info(
+            "Telegram update parsed: update_id=%s has_message=%s text=%r",
+            getattr(update, "update_id", None),
+            bool(getattr(update, "message", None)),
+            getattr(getattr(update, "message", None), "text", None),
+        )
+        bot.process_new_updates([update])
+        logger.info("Telegram update dispatched successfully: update_id=%s", getattr(update, "update_id", None))
         return jsonify({"ok": True}), 200
     except Exception:
         logger.exception("Telegram webhook update processing failed")
@@ -953,6 +969,16 @@ def start_instagram_webhook(bot) -> None:
                 drop_pending_updates=False,
             )
         logger.info("Telegram webhook configured: %s", telegram_webhook_url)
+        try:
+            info = bot.get_webhook_info()
+            logger.info(
+                "Telegram webhook info: url=%s pending=%s last_error=%s",
+                getattr(info, "url", ""),
+                getattr(info, "pending_update_count", None),
+                getattr(info, "last_error_message", None),
+            )
+        except Exception:
+            logger.exception("Could not read Telegram webhook info")
     except Exception:
         logger.exception("Failed to configure Telegram webhook")
 
