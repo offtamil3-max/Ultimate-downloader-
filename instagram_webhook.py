@@ -1197,6 +1197,81 @@ def _extract_instagram_links(value: Any) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def _send_instagram_dm_inspection(
+    bot,
+    message_data: dict[str, Any] | None,
+    message_id: str | None = None,
+) -> None:
+    """Send a redacted JSON inspection file to Telegram for debugging."""
+    if not TARGET_CHANNEL_ID or not isinstance(message_data, dict):
+        return
+
+    sensitive_keys = {
+        "access_token", "authorization", "cookie", "cookies",
+        "sessionid", "session_id", "password", "csrf_token",
+    }
+
+    def sanitize(value: Any, key: str = "") -> Any:
+        if key.lower() in sensitive_keys:
+            return "[REDACTED]"
+        if isinstance(value, dict):
+            return {str(k): sanitize(v, str(k)) for k, v in value.items()}
+        if isinstance(value, list):
+            return [sanitize(v, key) for v in value]
+        return value
+
+    def collect_urls(value: Any, out: list[str]) -> None:
+        if isinstance(value, str):
+            out.extend(re.findall(r"https?://[^\\s\"']+", value))
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                collect_urls(v, out)
+        elif isinstance(value, list):
+            for v in value:
+                collect_urls(v, out)
+
+    try:
+        _send_instagram_dm_inspection(
+            bot,
+            message_data,
+            message_id=message_id,
+        )
+
+        urls: list[str] = []
+        collect_urls(message_data, urls)
+        urls = list(dict.fromkeys(urls))
+        report = {
+            "message_id": message_id,
+            "instagram_canonical_urls": [
+                u for u in urls
+                if "instagram.com/" in u.lower()
+                and re.search(r"/(?:p|reel|tv)/", u, re.I)
+            ],
+            "all_url_candidates": urls[:100],
+            "message_data": sanitize(message_data),
+        }
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="ig_inspection_"))
+        try:
+            safe_mid = re.sub(r"[^A-Za-z0-9_-]", "_", str(message_id or "unknown"))
+            path = temp_dir / f"instagram_dm_inspection_{safe_mid}.json"
+            path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            with path.open("rb") as fh:
+                bot.send_document(
+                    TARGET_CHANNEL_ID,
+                    fh,
+                    caption="Instagram DM inspection JSON — check instagram_canonical_urls.",
+                )
+            logger.info("Instagram DM inspection JSON sent to Telegram")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    except Exception:
+        logger.exception("Instagram DM inspection JSON failed")
+
+
 def _download_and_forward(
     bot,
     attachments: list[dict[str, Any]],
