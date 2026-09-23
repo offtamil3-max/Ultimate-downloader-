@@ -338,3 +338,86 @@ try:
 except Exception:
     logger.debug("Instagram HTML attachment fallback patch not loaded", exc_info=True)
 
+# Browser resolver: when Graph/private APIs cannot recover the original share
+# URL, open the derived Instagram post in Chromium using the existing session.
+try:
+    _mod = __import__("instagram_webhook")
+    _original_forward = getattr(_mod, "_download_and_forward", None)
+
+    def _browser_forward(
+        bot,
+        attachments,
+        caption=None,
+        message_id=None,
+        sender_id=None,
+    ):
+        if (
+            os.getenv("INSTAGRAM_BROWSER_RESOLVER", "1").strip().lower()
+            not in {"0", "false", "no", "off"}
+            and callable(_original_forward)
+        ):
+            try:
+                media_ids = []
+                for attachment in attachments or []:
+                    payload = attachment.get("payload") if isinstance(attachment, dict) else None
+                    if not isinstance(payload, dict):
+                        continue
+                    media_id = (
+                        payload.get("ig_post_media_id")
+                        or payload.get("media_id")
+                        or payload.get("id")
+                    )
+                    if isinstance(media_id, str) and media_id.isdigit():
+                        media_ids.append(media_id)
+
+                cookie = os.getenv("INSTAGRAM_SESSION_COOKIE", "").strip()
+                if media_ids and cookie:
+                    from instagram_browser import resolve_media_id
+
+                    for media_id in media_ids:
+                        browser_urls = resolve_media_id(media_id, cookie)
+                        for url in browser_urls:
+                            try:
+                                resolved_files, resolved_dir = _mod.download_public_url(url)
+                                if resolved_files:
+                                    if resolved_dir:
+                                        _mod._send_to_telegram(
+                                            bot, resolved_files, caption=caption
+                                        )
+                                    else:
+                                        _mod._send_to_telegram(
+                                            bot, resolved_files, caption=caption
+                                        )
+                                    import shutil
+                                    if resolved_dir:
+                                        shutil.rmtree(resolved_dir, ignore_errors=True)
+                                    logger.info(
+                                        "Instagram browser original-link download succeeded: %d file(s)",
+                                        len(resolved_files),
+                                    )
+                                    return
+                                if resolved_dir:
+                                    import shutil
+                                    shutil.rmtree(resolved_dir, ignore_errors=True)
+                            except Exception:
+                                logger.info(
+                                    "Instagram browser canonical download failed",
+                                    exc_info=True,
+                                )
+            except Exception:
+                logger.exception("Instagram browser resolver integration failed")
+
+        return _original_forward(
+            bot,
+            attachments,
+            caption=caption,
+            message_id=message_id,
+            sender_id=sender_id,
+        )
+
+    if callable(_original_forward):
+        _mod._download_and_forward = _browser_forward
+        logger.info("Instagram Playwright browser resolver integration loaded")
+except Exception:
+    logger.debug("Instagram Playwright browser resolver integration not loaded", exc_info=True)
+
