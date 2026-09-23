@@ -4,3 +4,4 @@ gallery-dl
 requests
 Flask
 instaloader>=4.14.3,<5
+instagrapi>=3.0.12,<4
