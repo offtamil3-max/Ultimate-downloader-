@@ -687,7 +687,30 @@ def _instagram_mobile_media_urls(media_id: str) -> list[str]:
                 )
                 continue
 
-            data = response.json()
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if "json" not in content_type:
+                logger.info(
+                    "Instagram media-info returned non-JSON host=%s HTTP=%s content_type=%s body_prefix=%r",
+                    host,
+                    response.status_code,
+                    content_type,
+                    response.text[:160],
+                )
+                continue
+
+            try:
+                data = response.json()
+            except ValueError:
+                logger.info(
+                    "Instagram media-info returned invalid JSON host=%s HTTP=%s body_prefix=%r",
+                    host,
+                    response.status_code,
+                    response.text[:160],
+                )
+                continue
+
+            if not isinstance(data, dict):
+                continue
             items = data.get("items") or []
             if not items or not isinstance(items[0], dict):
                 continue
@@ -959,6 +982,7 @@ def _download_and_forward(
     caption: str | None = None,
     message_id: str | None = None,
     sender_id: str | None = None,
+    ig_user_id: str | None = None,
 ) -> None:
     temp_dirs: list[str] = []
     all_files: list[Path] = []
@@ -1003,6 +1027,53 @@ def _download_and_forward(
                 if all_files:
                     _send_to_telegram(bot, all_files, caption=caption)
                     return
+
+        # Meta's webhook can provide only a thin ig_post attachment.
+        # Before falling back to the signed preview URL, ask the Graph
+        # message/attachments endpoints for richer share metadata. This path
+        # does not require an Instagram session cookie.
+        if message_id and INSTAGRAM_ACCESS_TOKEN:
+            try:
+                recovered_attachments, recovered_links = _graph_message_details(
+                    message_id=message_id,
+                    ig_user_id=ig_user_id,
+                    sender_id=sender_id,
+                )
+                if recovered_attachments:
+                    logger.info(
+                        "Instagram connector Graph fallback recovered %d attachment record(s)",
+                        len(recovered_attachments),
+                    )
+                    attachments = recovered_attachments + attachments
+                if recovered_links:
+                    logger.info(
+                        "Instagram connector Graph fallback recovered %d canonical URL(s)",
+                        len(recovered_links),
+                    )
+                    for recovered_url in recovered_links:
+                        try:
+                            resolved_files, resolved_dir = download_public_url(recovered_url)
+                            if resolved_files:
+                                if resolved_dir:
+                                    temp_dirs.append(resolved_dir)
+                                all_files.extend(resolved_files)
+                                logger.info(
+                                    "Instagram connector Graph canonical URL download succeeded: %d file(s)",
+                                    len(resolved_files),
+                                )
+                                break
+                            if resolved_dir:
+                                shutil.rmtree(resolved_dir, ignore_errors=True)
+                        except Exception:
+                            logger.exception(
+                                "Instagram connector Graph canonical URL download failed: %s",
+                                recovered_url,
+                            )
+                    if all_files:
+                        _send_to_telegram(bot, all_files, caption=caption)
+                        return
+            except Exception:
+                logger.exception("Instagram connector Graph message fallback failed")
 
         for attachment in attachments:
             if not isinstance(attachment, dict):
@@ -1259,9 +1330,11 @@ def _handle_event(bot, event: dict[str, Any]) -> None:
             len(attachments),
         )
 
+        ig_user_id = str(event.get("id") or "").strip() or None
+
         threading.Thread(
             target=_download_and_forward,
-            args=(bot, attachments, caption, mid, sender_id),
+            args=(bot, attachments, caption, mid, sender_id, ig_user_id),
             daemon=True,
         ).start()
 
