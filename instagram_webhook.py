@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import mimetypes
 import os
@@ -1232,23 +1233,32 @@ def _send_instagram_dm_inspection(
                 collect_urls(v, out)
 
     try:
-        _send_instagram_dm_inspection(
-            bot,
-            message_data,
-            message_id=message_id,
-        )
-
         urls: list[str] = []
         collect_urls(message_data, urls)
         urls = list(dict.fromkeys(urls))
+
+        # Keep URL paths useful for debugging, but strip query strings because
+        # Instagram CDN URLs can contain temporary signed access parameters.
+        safe_urls: list[str] = []
+        for url in urls:
+            try:
+                from urllib.parse import urlsplit, urlunsplit
+                parts = urlsplit(url)
+                safe_urls.append(
+                    urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+                )
+            except Exception:
+                safe_urls.append(url.split("?", 1)[0].split("#", 1)[0])
+        safe_urls = list(dict.fromkeys(safe_urls))
+
         report = {
             "message_id": message_id,
             "instagram_canonical_urls": [
-                u for u in urls
+                u for u in safe_urls
                 if "instagram.com/" in u.lower()
                 and re.search(r"/(?:p|reel|tv)/", u, re.I)
             ],
-            "all_url_candidates": urls[:100],
+            "all_url_candidates": safe_urls[:100],
             "message_data": sanitize(message_data),
         }
 
@@ -1284,6 +1294,14 @@ def _download_and_forward(
 ) -> None:
     temp_dirs: list[str] = []
     all_files: list[Path] = []
+
+    # Always send the redacted webhook payload snapshot first. This lets us
+    # verify exactly what Meta delivered before trying any resolver.
+    _send_instagram_dm_inspection(
+        bot,
+        message_data,
+        message_id=message_id,
+    )
 
     try:
         urls: list[str] = []
