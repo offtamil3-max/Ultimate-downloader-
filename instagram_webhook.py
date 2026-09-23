@@ -470,6 +470,23 @@ def _graph_message_details(message_id: str, ig_user_id: str | None = None, sende
 
     return [], []
 
+def _media_id_to_shortcode(media_id: str) -> str | None:
+    """Convert a numeric Instagram media ID to its public shortcode."""
+    try:
+        value = int(media_id)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    chars: list[str] = []
+    while value:
+        chars.append(alphabet[value & 63])
+        value >>= 6
+    return "".join(reversed(chars))
+
+
 def _download_and_forward(
     bot, attachments: list[dict[str, Any]], caption: str | None = None
 ) -> None:
@@ -552,6 +569,44 @@ def _download_and_forward(
                     logger.exception(
                         "Instagram permalink fallback failed"
                     )
+
+            # New ig_post webhooks may omit the public permalink entirely.
+            # The numeric ig_post_media_id can be converted to Instagram's
+            # public shortcode, so try the public post URL before falling back
+            # to the single signed CDN attachment. This is especially useful
+            # for carousel posts whose /children edge is inaccessible to the
+            # recipient's API token.
+            if (
+                isinstance(media_id, str)
+                and not isinstance(post_link, str)
+                and "instagram.com" not in str(post_link)
+            ):
+                shortcode = _media_id_to_shortcode(media_id)
+                if shortcode:
+                    derived_link = f"https://www.instagram.com/p/{shortcode}/"
+                    try:
+                        logger.info(
+                            "Instagram permalink absent; trying media-ID derived public URL"
+                        )
+                        permalink_files, permalink_dir = download_public_url(derived_link)
+                        if permalink_files:
+                            if permalink_dir:
+                                temp_dirs.append(permalink_dir)
+                            all_files.extend(permalink_files)
+                            logger.info(
+                                "Instagram media-ID permalink fallback downloaded %d file(s)",
+                                len(permalink_files),
+                            )
+                            continue
+                        if permalink_dir:
+                            shutil.rmtree(permalink_dir, ignore_errors=True)
+                        logger.warning(
+                            "Instagram media-ID permalink fallback returned no files"
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Instagram media-ID permalink fallback failed"
+                        )
 
             # Final fallback for ordinary webhook attachments or when the
             # public permalink cannot be extracted.
