@@ -1715,6 +1715,15 @@ def _handle_event(bot, event: dict[str, Any]) -> None:
             len(attachments),
         )
 
+        # Send the redacted webhook snapshot immediately, before any resolver
+        # or downloader work. This proves whether Meta delivered the original
+        # shared-post payload to this connector.
+        _send_instagram_dm_inspection(
+            bot,
+            message,
+            message_id=mid,
+        )
+
         ig_user_id = str(event.get("id") or "").strip() or None
 
         threading.Thread(
