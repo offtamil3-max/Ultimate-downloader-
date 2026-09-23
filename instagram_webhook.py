@@ -357,7 +357,7 @@ def _graph_media_urls(media_id: str) -> list[str]:
     return urls
 
 
-def _graph_message_details(message_id: str) -> tuple[list[dict[str, Any]], list[str]]:
+def _graph_message_details(message_id: str, ig_user_id: str | None = None, sender_id: str | None = None) -> tuple[list[dict[str, Any]], list[str]]:
     """Fetch the full Instagram message when the webhook only exposes a thin share attachment."""
     if not INSTAGRAM_ACCESS_TOKEN or not message_id:
         return [], []
@@ -367,6 +367,44 @@ def _graph_message_details(message_id: str) -> tuple[list[dict[str, Any]], list[
         f"https://graph.instagram.com/{GRAPH_VERSION}/{message_id}",
         f"https://graph.facebook.com/{GRAPH_VERSION}/{message_id}",
     ]
+
+    def collect_details(data: Any) -> tuple[list[dict[str, Any]], list[str]]:
+        recovered: list[dict[str, Any]] = []
+        links: list[str] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, list):
+                for item in value:
+                    collect(item)
+                return
+            if not isinstance(value, dict):
+                return
+
+            payload = value.get("payload")
+            if isinstance(payload, dict):
+                recovered.append({"payload": payload, "type": value.get("type")})
+                for key in ("link", "url", "permalink", "permalink_url"):
+                    candidate = payload.get(key)
+                    if isinstance(candidate, str) and "instagram.com" in candidate:
+                        links.append(candidate)
+
+            for key in ("link", "permalink", "permalink_url"):
+                candidate = value.get(key)
+                if isinstance(candidate, str) and "instagram.com" in candidate:
+                    links.append(candidate)
+
+            for key in ("data", "attachments", "shares", "elements"):
+                if key in value:
+                    collect(value.get(key))
+
+            nested_message = value.get("message")
+            if isinstance(nested_message, dict):
+                collect(nested_message)
+
+        collect(data.get("attachments"))
+        collect(data.get("shares"))
+        collect(data.get("message"))
+        return recovered, list(dict.fromkeys(links))
 
     for endpoint in endpoints:
         try:
@@ -382,42 +420,68 @@ def _graph_message_details(message_id: str) -> tuple[list[dict[str, Any]], list[
                 logger.info("Instagram message lookup failed: HTTP %s", response.status_code)
                 continue
 
-            data = response.json()
-            recovered: list[dict[str, Any]] = []
-            links: list[str] = []
-
-            def collect(value: Any) -> None:
-                if isinstance(value, list):
-                    for item in value:
-                        collect(item)
-                    return
-                if not isinstance(value, dict):
-                    return
-
-                payload = value.get("payload")
-                if isinstance(payload, dict):
-                    recovered.append({"payload": payload, "type": value.get("type")})
-                    for key in ("link", "url", "permalink", "permalink_url"):
-                        candidate = payload.get(key)
-                        if isinstance(candidate, str) and "instagram.com" in candidate:
-                            links.append(candidate)
-
-                for key in ("link", "permalink", "permalink_url"):
-                    candidate = value.get(key)
-                    if isinstance(candidate, str) and "instagram.com" in candidate:
-                        links.append(candidate)
-
-                for key in ("data", "attachments", "shares", "elements"):
-                    if key in value:
-                        collect(value.get(key))
-
-            collect(data.get("attachments"))
-            collect(data.get("shares"))
-
-            logger.info("Instagram message lookup recovered %d attachment record(s) and %d permalink(s)", len(recovered), len(links))
-            return recovered, list(dict.fromkeys(links))
+            recovered, links = collect_details(response.json())
+            logger.info(
+                "Instagram message lookup recovered %d attachment record(s) and %d permalink(s)",
+                len(recovered),
+                len(links),
+            )
+            if recovered or links:
+                return recovered, links
         except Exception:
             logger.exception("Instagram message lookup errored")
+
+    if ig_user_id and sender_id:
+        try:
+            conversations_response = requests.get(
+                f"https://graph.instagram.com/{GRAPH_VERSION}/{ig_user_id}/conversations",
+                params={
+                    "user_id": sender_id,
+                    "access_token": INSTAGRAM_ACCESS_TOKEN,
+                },
+                timeout=(15, 30),
+            )
+            if conversations_response.ok:
+                conversations = conversations_response.json().get("data", [])
+                for conversation in conversations:
+                    if not isinstance(conversation, dict):
+                        continue
+                    conversation_id = conversation.get("id")
+                    if not isinstance(conversation_id, str):
+                        continue
+
+                    messages_response = requests.get(
+                        f"https://graph.instagram.com/{GRAPH_VERSION}/{conversation_id}",
+                        params={
+                            "fields": "messages{id,attachments,shares,message,created_time}",
+                            "access_token": INSTAGRAM_ACCESS_TOKEN,
+                        },
+                        timeout=(15, 30),
+                    )
+                    if not messages_response.ok:
+                        continue
+
+                    messages_data = messages_response.json()
+                    for msg in messages_data.get("messages", {}).get("data", []):
+                        if not isinstance(msg, dict):
+                            continue
+                        if msg.get("id") != message_id:
+                            continue
+
+                        recovered, links = collect_details(msg)
+                        logger.info(
+                            "Instagram conversation lookup matched webhook mid; recovered %d attachment record(s) and %d permalink(s)",
+                            len(recovered),
+                            len(links),
+                        )
+                        return recovered, links
+            else:
+                logger.info(
+                    "Instagram conversation lookup failed: HTTP %s",
+                    conversations_response.status_code,
+                )
+        except Exception:
+            logger.exception("Instagram conversation lookup errored")
 
     return [], []
 
@@ -568,7 +632,11 @@ def _handle_event(bot, event: dict[str, Any]) -> None:
         # Query the message resource too. The share webhook can expose only
         # one CDN URL, while the message resource may expose richer
         # attachment/share metadata.
-        recovered_attachments, recovered_links = _graph_message_details(mid)
+        recovered_attachments, recovered_links = _graph_message_details(
+            mid,
+            ig_user_id=event.get("id"),
+            sender_id=(item.get("sender") or {}).get("id") if isinstance(item.get("sender"), dict) else None,
+        )
         if recovered_attachments:
             attachments.extend(recovered_attachments)
         for recovered_link in recovered_links:
