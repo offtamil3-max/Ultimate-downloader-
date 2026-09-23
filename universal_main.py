@@ -7,6 +7,7 @@ router. The fallback delegates extraction to gallery-dl and yt-dlp.
 """
 
 import logging
+import threading
 from pathlib import Path
 
 import telebot
@@ -112,3 +113,8 @@ if __name__ == "__main__":
     logger.info("Starting Ultimate Downloader Bot with universal webhook...")
     Path(existing.DOWNLOAD_ROOT).mkdir(exist_ok=True)
     start_instagram_webhook(bot)
+    # Keep the Railway worker process alive. The Flask server runs in a
+    # background daemon thread; without this wait the main process exits,
+    # causing Railway to mark the deployment Completed instead of keeping
+    # the service Active.
+    threading.Event().wait()
