@@ -1022,7 +1022,10 @@ def _instagram_browser_shared_post_urls(
 
     cookie_header = _instagram_cookie_header()
     if not cookie_header:
-        logger.info("Instagram browser resolver skipped: no session cookie")
+        logger.info(
+            "Instagram browser resolver skipped: no authenticated session; "
+            "continuing with webhook/Graph/public resolvers"
+        )
         return []
 
     try:
@@ -1169,6 +1172,31 @@ def _instagram_browser_shared_post_urls(
         return []
 
 
+def _extract_instagram_links(value: Any) -> list[str]:
+    """Recursively extract canonical Instagram post/reel URLs from webhook data."""
+    found: list[str] = []
+
+    def walk(item: Any) -> None:
+        if isinstance(item, str):
+            for match in re.findall(
+                r'https?://(?:www\\.)?instagram\\.com/(?:p|reel|tv)/[A-Za-z0-9_-]+(?:/)?',
+                item,
+                flags=re.I,
+            ):
+                found.append(match.rstrip("/"))
+            return
+        if isinstance(item, dict):
+            for child in item.values():
+                walk(child)
+            return
+        if isinstance(item, list):
+            for child in item:
+                walk(child)
+
+    walk(value)
+    return list(dict.fromkeys(found))
+
+
 def _download_and_forward(
     bot,
     attachments: list[dict[str, Any]],
@@ -1176,6 +1204,7 @@ def _download_and_forward(
     message_id: str | None = None,
     sender_id: str | None = None,
     ig_user_id: str | None = None,
+    message_data: dict[str, Any] | None = None,
 ) -> None:
     temp_dirs: list[str] = []
     all_files: list[Path] = []
@@ -1220,6 +1249,39 @@ def _download_and_forward(
                 if all_files:
                     _send_to_telegram(bot, all_files, caption=caption)
                     return
+
+        # First inspect the complete webhook message object itself.
+        # This path requires no cookie and no browser session. If Meta includes
+        # a canonical shared-post URL anywhere in the payload, the normal
+        # public downloader can expand the full carousel.
+        webhook_links = _extract_instagram_links(message_data or {})
+        if webhook_links:
+            logger.info(
+                "Instagram webhook payload contained %d canonical URL(s)",
+                len(webhook_links),
+            )
+            for webhook_url in webhook_links:
+                try:
+                    resolved_files, resolved_dir = download_public_url(webhook_url)
+                    if resolved_files:
+                        if resolved_dir:
+                            temp_dirs.append(resolved_dir)
+                        all_files.extend(resolved_files)
+                        logger.info(
+                            "Instagram webhook canonical URL download succeeded: %d file(s)",
+                            len(resolved_files),
+                        )
+                        break
+                    if resolved_dir:
+                        shutil.rmtree(resolved_dir, ignore_errors=True)
+                except Exception:
+                    logger.exception(
+                        "Instagram webhook canonical URL download failed: %s",
+                        webhook_url,
+                    )
+            if all_files:
+                _send_to_telegram(bot, all_files, caption=caption)
+                return
 
         # Optional browser-session resolver. It is deliberately a
         # separate feature switch so the normal downloader/resolver chain is
@@ -1563,7 +1625,7 @@ def _handle_event(bot, event: dict[str, Any]) -> None:
 
         threading.Thread(
             target=_download_and_forward,
-            args=(bot, attachments, caption, mid, sender_id, ig_user_id),
+            args=(bot, attachments, caption, mid, sender_id, ig_user_id, message),
             daemon=True,
         ).start()
 
