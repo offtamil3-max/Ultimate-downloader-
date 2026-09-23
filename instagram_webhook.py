@@ -258,13 +258,14 @@ def _instagram_cookie_header() -> str:
             from http.cookiejar import MozillaCookieJar
 
             jar = MozillaCookieJar(cookie_path)
-        jar.load(ignore_discard=True, ignore_expires=True)
-        pairs = []
-        for cookie in jar:
-            domain = (cookie.domain or "").lower()
-            if "instagram.com" in domain:
-                pairs.append(f"{cookie.name}={cookie.value}")
-            return "; ".join(pairs)
+            jar.load(ignore_discard=True, ignore_expires=True)
+            pairs = []
+            for cookie in jar:
+                domain = (cookie.domain or "").lower()
+                if "instagram.com" in domain:
+                    pairs.append(f"{cookie.name}={cookie.value}")
+            if pairs:
+                return "; ".join(pairs)
         except Exception:
             logger.debug("Could not load Instagram cookies from %s", cookie_path, exc_info=True)
 
