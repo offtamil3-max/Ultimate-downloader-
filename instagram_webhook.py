@@ -243,27 +243,53 @@ def _instagram_token_ok() -> bool:
 
 
 def _instagram_cookie_header() -> str:
-    """Build an Instagram cookie header from an explicit session cookie or cookies.txt."""
+    """Build Instagram cookies dynamically, including Railway COOKIES_CONTENT."""
     if INSTAGRAM_SESSION_COOKIE:
         return INSTAGRAM_SESSION_COOKIE
 
-    if not COOKIES_FILE:
-        return ""
+    # main.py writes COOKIES_CONTENT to cookies.txt after imports happen, so
+    # do not rely only on the module-level COOKIES_FILE value.
+    cookie_path = COOKIES_FILE
+    if not cookie_path and Path("cookies.txt").exists():
+        cookie_path = "cookies.txt"
 
-    try:
-        from http.cookiejar import MozillaCookieJar
+    if cookie_path:
+        try:
+            from http.cookiejar import MozillaCookieJar
 
-        jar = MozillaCookieJar(COOKIES_FILE)
+            jar = MozillaCookieJar(cookie_path)
         jar.load(ignore_discard=True, ignore_expires=True)
         pairs = []
         for cookie in jar:
             domain = (cookie.domain or "").lower()
             if "instagram.com" in domain:
                 pairs.append(f"{cookie.name}={cookie.value}")
-        return "; ".join(pairs)
-    except Exception:
-        logger.debug("Could not load Instagram cookies from %s", COOKIES_FILE, exc_info=True)
-        return ""
+            return "; ".join(pairs)
+        except Exception:
+            logger.debug("Could not load Instagram cookies from %s", cookie_path, exc_info=True)
+
+    # Also accept a Netscape cookies.txt payload directly from Railway.
+    # This is useful when the file is created by main.py only after this
+    # module has already been imported.
+    cookies_content = os.getenv("COOKIES_CONTENT", "").strip()
+    if cookies_content:
+        try:
+            pairs = []
+            for line in cookies_content.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if len(fields) >= 7:
+                    name, value = fields[5], fields[6]
+                    if name and value:
+                        pairs.append(f"{name}={value}")
+            if pairs:
+                return "; ".join(pairs)
+        except Exception:
+            logger.debug("Could not parse COOKIES_CONTENT", exc_info=True)
+
+    return ""
 
 
 def _instagram_mobile_headers(host: str) -> dict[str, str]:
