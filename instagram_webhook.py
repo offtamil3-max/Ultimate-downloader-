@@ -178,6 +178,43 @@ def _download_instagram_attachment(
         raise
 
 
+def _instagram_token_ok() -> bool:
+    """Validate the token against the Instagram Graph host only."""
+    if not INSTAGRAM_ACCESS_TOKEN:
+        return False
+    try:
+        response = requests.get(
+            f"https://graph.instagram.com/{GRAPH_VERSION}/me",
+            params={
+                "fields": "id,username",
+                "access_token": INSTAGRAM_ACCESS_TOKEN,
+            },
+            timeout=(15, 20),
+        )
+        if response.ok:
+            data = response.json()
+            logger.info(
+                "Instagram token validation OK: id=%s username_present=%s",
+                data.get("id"),
+                bool(data.get("username")),
+            )
+            return True
+        try:
+            err = response.json().get("error", {})
+            logger.warning(
+                "Instagram token validation failed: HTTP %s code=%s type=%s message=%s",
+                response.status_code,
+                err.get("code"),
+                err.get("type"),
+                err.get("message") or err.get("error_user_msg"),
+            )
+        except Exception:
+            logger.warning("Instagram token validation failed: HTTP %s", response.status_code)
+    except Exception:
+        logger.exception("Instagram token validation request errored")
+    return False
+
+
 def _graph_media_urls(media_id: str) -> list[str]:
     """Resolve an Instagram media ID, expanding carousel children."""
     if not INSTAGRAM_ACCESS_TOKEN:
@@ -236,58 +273,6 @@ def _graph_media_urls(media_id: str) -> list[str]:
             error_type,
             error_message,
         )
-
-        # Compatibility fallback for integrations where the media object is
-        # exposed through the Facebook Graph hostname.
-        try:
-            fb_children_response = requests.get(
-                f"https://graph.facebook.com/{GRAPH_VERSION}/{media_id}/children",
-                params={
-                    "fields": "id,media_type,media_url",
-                    "access_token": INSTAGRAM_ACCESS_TOKEN,
-                    "limit": 100,
-                },
-                timeout=(15, 30),
-            )
-            if fb_children_response.ok:
-                fb_children_data = fb_children_response.json()
-                for child in fb_children_data.get("data", []):
-                    if not isinstance(child, dict):
-                        continue
-                    media_url = child.get("media_url")
-                    if isinstance(media_url, str) and media_url.startswith(
-                        ("http://", "https://")
-                    ):
-                        urls.append(media_url)
-                logger.info(
-                    "Instagram Facebook-Graph fallback returned %d child URL(s) for %s",
-                    len(urls),
-                    media_id,
-                )
-            else:
-                try:
-                    fb_error = fb_children_response.json().get("error", {})
-                    fb_message = (
-                        fb_error.get("message")
-                        or fb_error.get("error_user_msg")
-                        or fb_children_response.text[:200]
-                    )
-                    fb_code = fb_error.get("code")
-                except Exception:
-                    fb_message = fb_children_response.text[:200]
-                    fb_code = None
-                logger.warning(
-                    "Instagram Facebook-Graph /children fallback failed for media %s: HTTP %s code=%s message=%s",
-                    media_id,
-                    fb_children_response.status_code,
-                    fb_code,
-                    fb_message,
-                )
-        except Exception:
-            logger.exception(
-                "Instagram Facebook-Graph /children fallback errored for media %s",
-                media_id,
-            )
 
     # If /children did not resolve anything, first ask only for media_type.
     # A CAROUSEL_ALBUM parent has no media_url field, so requesting
@@ -363,9 +348,9 @@ def _graph_message_details(message_id: str, ig_user_id: str | None = None, sende
         return [], []
 
     fields = "id,attachments,shares,message"
+    # Instagram Login tokens are for graph.instagram.com.
     endpoints = [
         f"https://graph.instagram.com/{GRAPH_VERSION}/{message_id}",
-        f"https://graph.facebook.com/{GRAPH_VERSION}/{message_id}",
     ]
 
     def collect_details(data: Any) -> tuple[list[dict[str, Any]], list[str]]:
@@ -785,6 +770,8 @@ def start_instagram_webhook(bot) -> None:
             "INSTAGRAM_ACCESS_TOKEN is not configured; carousel expansion "
             "will fall back to the webhook's single media URL."
         )
+    else:
+        _instagram_token_ok()
 
     app.config["telegram_bot"] = bot
 
